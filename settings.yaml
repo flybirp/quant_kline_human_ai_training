@@ -1,0 +1,39 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]: 爆竹K线 · Web
+    - navigation [ref=e6]:
+      - button "训练设置" [ref=e7] [cursor=pointer]
+      - button "历史统计" [ref=e8] [cursor=pointer]
+  - main [ref=e9]:
+    - generic [ref=e10]:
+      - generic [ref=e11]: 开始一场 K 线训练
+      - generic [ref=e12]: 系统会隐藏股票代码与日期，逐根回放真实历史 K 线，请你做出买卖决策。
+      - generic [ref=e13]:
+        - generic [ref=e14]: 训练品种
+        - generic [ref=e15]:
+          - button "随机股票" [ref=e16] [cursor=pointer]
+          - button "指定股票" [ref=e17] [cursor=pointer]
+      - generic [ref=e18]:
+        - generic [ref=e19]: K 线周期
+        - generic [ref=e20]:
+          - button "日线" [ref=e21] [cursor=pointer]
+          - button "周线" [ref=e22] [cursor=pointer]
+          - button "月线" [ref=e23] [cursor=pointer]
+      - generic [ref=e24]:
+        - generic [ref=e25]: 初始资金用于模拟买卖，训练盈亏据此计算
+        - spinbutton [ref=e26]: "100000"
+      - generic [ref=e27]:
+        - generic [ref=e28]: 均线参数
+        - generic [ref=e29]:
+          - generic [ref=e30] [cursor=pointer]: MA5
+          - generic [ref=e31] [cursor=pointer]: MA10
+          - generic [ref=e32] [cursor=pointer]: MA20
+          - generic [ref=e33] [cursor=pointer]: MA60
+      - generic [ref=e34]:
+        - generic [ref=e35]:
+          - generic [ref=e36]: 预热根数开局直接展示的历史 K 线数
+          - spinbutton [ref=e37]: "60"
+        - generic [ref=e38]:
+          - generic [ref=e39]: 决策根数需要你逐根做买卖决策的数量
+          - spinbutton [ref=e40]: "40"
+      - button "开始训练" [ref=e41] [cursor=pointer]
