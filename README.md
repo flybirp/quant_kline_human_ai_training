@@ -30,7 +30,7 @@
 ### 环境要求
 
 - Node.js 18 及以上
-- 行情数据：本地 CSV 文件（见下方「行情数据格式」），默认读取 `~/Documents/mainland_data_2014` 目录
+- 行情数据：本地 CSV 文件（见下方「行情数据格式」），默认读取 `~/Documents/mainland_data_2014` 目录（**前复权**数据）
 
 ### 安装与启动
 
@@ -54,6 +54,8 @@ cd web && npm run dev
 ### 行情数据格式
 
 每个股票一个 CSV 文件（文件名即股票代码，如 `600519.csv`），放到数据目录（默认 `~/Documents/mainland_data_2014`，可用环境变量 `DATA_DIR` 修改），每行格式：
+
+> 数据需为**前复权**行情（已按分红送股做价格调整），保证跨除权除息日的 K 线连续可比，否则复权跳空会干扰买卖判断与收益计算。`~/Documents/mainland_data_2014` 即存放前复权数据。
 
 ```csv
 date,open,close,high,low,volume
@@ -109,7 +111,7 @@ AI 和你看到的信息**完全一致**：只有已揭示的 K 线（隐藏日�
 │   └── .env                #   LLM 配置（自行创建，不入库）
 ├── web/                    # React + Vite 前端
 │   └── src/pages/          #   Home / Settings / Training / Stats 四个页面
-└── (数据目录)               # ~/Documents/mainland_data_2014，行情 CSV
+└── (数据目录)               # ~/Documents/mainland_data_2014，前复权行情 CSV
 ```
 
 ## 常见问题
