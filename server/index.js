@@ -139,6 +139,79 @@ app.get('/api/kline/:code', (req, res) => {
   res.json({ code, period, count: bars.length, bars });
 });
 
+// ---- 训练记录：JSON 文件存储（server/data/records.json） ----
+const DATA_DIR_PATH = path.dirname(fileURLToPath(import.meta.url));
+const RECORDS_FILE = path.join(DATA_DIR_PATH, 'data', 'records.json');
+
+function loadRecordsFile() {
+  try {
+    const data = JSON.parse(fs.readFileSync(RECORDS_FILE, 'utf8'));
+    return {
+      records: Array.isArray(data.records) ? data.records : [],
+      starred: Array.isArray(data.starred) ? data.starred.filter((x) => typeof x === 'string') : [],
+    };
+  } catch {
+    return { records: [], starred: [] };
+  }
+}
+
+function saveRecordsFile(data) {
+  fs.mkdirSync(path.dirname(RECORDS_FILE), { recursive: true });
+  fs.writeFileSync(RECORDS_FILE, JSON.stringify(data, null, 2));
+}
+
+app.get('/api/records', (req, res) => {
+  res.json(loadRecordsFile());
+});
+
+// 新增一条训练记录（按 id 去重）
+app.post('/api/records', (req, res) => {
+  const record = req.body && req.body.record;
+  if (!record || typeof record !== 'object' || !record.id) {
+    res.status(400).json({ error: 'invalid record' });
+    return;
+  }
+  const data = loadRecordsFile();
+  data.records = [record, ...data.records.filter((r) => r.id !== record.id)];
+  saveRecordsFile(data);
+  res.json(data);
+});
+
+// 整体替换（localStorage 一次性迁移用）
+app.put('/api/records', (req, res) => {
+  const body = req.body || {};
+  const records = Array.isArray(body.records) ? body.records : null;
+  if (!records) {
+    res.status(400).json({ error: 'invalid records array' });
+    return;
+  }
+  const starred = Array.isArray(body.starred)
+    ? body.starred.filter((x) => typeof x === 'string')
+    : [];
+  saveRecordsFile({ records, starred });
+  res.json({ records, starred });
+});
+
+app.delete('/api/records', (req, res) => {
+  saveRecordsFile({ records: [], starred: [] });
+  res.json({ records: [], starred: [] });
+});
+
+// 收藏标记 toggle
+app.post('/api/records/star', (req, res) => {
+  const id = req.body && req.body.id;
+  if (typeof id !== 'string' || !id) {
+    res.status(400).json({ error: 'invalid id' });
+    return;
+  }
+  const data = loadRecordsFile();
+  data.starred = data.starred.includes(id)
+    ? data.starred.filter((x) => x !== id)
+    : [...data.starred, id];
+  saveRecordsFile(data);
+  res.json({ starred: data.starred });
+});
+
 // ---- AI 托管：LLM 决策代理 ----
 // 从 server/.env 读取配置（无 dotenv 依赖，手动解析；已存在的环境变量优先）
 function loadLocalEnv() {
@@ -172,6 +245,7 @@ function extractJson(text) {
 // ---- AI 决策日志落盘（JSON Lines：每次 LLM 调用的完整 input/output） ----
 const AI_LOG_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'logs');
 const AI_LOG_FILE = path.join(AI_LOG_DIR, 'ai-decide.jsonl');
+const PREDICT_LOG_FILE = path.join(AI_LOG_DIR, 'ai-predict.jsonl');
 
 function logAiDecision(entry) {
   try {
@@ -189,11 +263,21 @@ app.post('/api/ai/decide', async (req, res) => {
     });
     return;
   }
-  const { system, user } = req.body || {};
+  const { system, user, mode, kind, sessionId, image } = req.body || {};
   if (typeof system !== 'string' || typeof user !== 'string' || !user) {
     res.status(400).json({ error: '参数缺失：需要 system 与 user' });
     return;
   }
+  // 会话 id：一场训练一个（前端生成），用于把流水日志与对账日志关联
+  const sid = typeof sessionId === 'string' && sessionId ? sessionId : null;
+  // 图表截图（jpeg base64）：有图时 user 消息转多模态格式，需 LLM 支持视觉输入
+  const img = typeof image === 'string' && image ? image : null;
+  const userContent = img
+    ? [
+        { type: 'text', text: user },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${img}` } },
+      ]
+    : user;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -208,7 +292,7 @@ app.post('/api/ai/decide', async (req, res) => {
         model: LLM_MODEL,
         messages: [
           { role: 'system', content: system },
-          { role: 'user', content: user },
+          { role: 'user', content: userContent },
         ],
         temperature: 0.1,
         max_tokens: 800,
@@ -228,6 +312,32 @@ app.post('/api/ai/decide', async (req, res) => {
     const content = msg.content || '';
     // 正文为空（推理 token 耗尽）时，退而从思考链中提取 JSON
     const parsed = extractJson(content) || extractJson(msg.reasoning_content || '');
+
+    // pred_and_wait 的「预测」响应：返回完整 Prediction JSON，由前端做归一化/截断
+    const isPredict = mode === 'pred_and_wait' && kind === 'predict';
+    if (isPredict) {
+      if (!parsed || typeof parsed !== 'object') {
+        const finish = data.choices?.[0]?.finish_reason || 'unknown';
+        res.status(502).json({
+          error: `LLM 输出无法解析（finish=${finish}）: ${String(content || msg.reasoning_content || '').slice(0, 300)}`,
+        });
+        return;
+      }
+      logAiDecision({
+        ts: new Date().toISOString(),
+        sessionId: sid,
+        mode,
+        kind,
+        usage: data.usage || null,
+        system,
+        user,
+        raw: content || msg.reasoning_content || '',
+        output: parsed,
+      });
+      res.json(parsed);
+      return;
+    }
+
     if (!parsed || !['buy', 'sell', 'hold'].includes(parsed.action)) {
       const finish = data.choices?.[0]?.finish_reason || 'unknown';
       res.status(502).json({
@@ -240,9 +350,16 @@ app.post('/api/ai/decide', async (req, res) => {
       lots: Math.max(1, Math.round(Number(parsed.lots) || 1)),
       reason: String(parsed.reason || '').slice(0, 200),
     };
+    // pred_and_wait 的「唤醒」响应可附修订预测，原样透传给前端归一化
+    if (mode === 'pred_and_wait' && kind === 'wake' && parsed.revised && typeof parsed.revised === 'object') {
+      payload.revised = parsed.revised;
+    }
     // 决策日志落盘：完整 input（system+user）与 output
     logAiDecision({
       ts: new Date().toISOString(),
+      sessionId: sid,
+      mode,
+      kind,
       usage: data.usage || null,
       system,
       user,
@@ -255,6 +372,22 @@ app.post('/api/ai/decide', async (req, res) => {
     res.status(504).json({ error: msg });
   } finally {
     clearTimeout(timer);
+  }
+});
+
+// ---- 打脸对账日志落盘（pred_and_wait 训练结束时前端提交 Outcome） ----
+app.post('/api/ai/predict-log', (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || !body.prediction) {
+    res.status(400).json({ error: '参数缺失：需要 prediction 等对账字段' });
+    return;
+  }
+  try {
+    fs.mkdirSync(AI_LOG_DIR, { recursive: true });
+    fs.appendFileSync(PREDICT_LOG_FILE, JSON.stringify(body) + '\n');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: `写入日志失败: ${e.message}` });
   }
 });
 

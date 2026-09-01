@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 server/logs/
+server/data/
 .playwright-cli/
 .DS_Store
 *.local

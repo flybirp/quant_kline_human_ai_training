@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Home from './pages/Home';
 import Settings from './pages/Settings';
 import Training from './pages/Training';
 import Stats from './pages/Stats';
 import { fetchStocks } from './api';
-import { saveRecord } from './store';
+import { migrateLocalRecords, saveRecord } from './store';
 import type { TrainingConfig, TrainingRecord } from './types';
 
 type View = 'home' | 'settings' | 'training' | 'stats';
@@ -15,6 +15,11 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [config, setConfig] = useState<TrainingConfig | null>(null);
+
+  // 启动时把旧版 localStorage 记录一次性迁移到服务端 JSON 文件
+  useEffect(() => {
+    migrateLocalRecords();
+  }, []);
 
   async function ensureStocks(): Promise<string[]> {
     if (stocks.length > 0) return stocks;
@@ -41,8 +46,12 @@ export default function App() {
     }
   }
 
-  function handleFinish(record: TrainingRecord) {
-    saveRecord(record);
+  async function handleFinish(record: TrainingRecord) {
+    try {
+      await saveRecord(record);
+    } catch (e) {
+      console.error('保存训练记录失败', e);
+    }
     setView('stats');
   }
 

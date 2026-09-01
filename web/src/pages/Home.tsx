@@ -1,11 +1,26 @@
-import { computeCoins, loadRecords, INITIAL_COINS } from '../store';
+import { useEffect, useState } from 'react';
+import { computeCoins, fetchRecords, INITIAL_COINS } from '../store';
 
 interface Props {
   onStart: () => void;
 }
 
 export default function Home({ onStart }: Props) {
-  const coins = computeCoins(loadRecords());
+  const [coins, setCoins] = useState(INITIAL_COINS);
+
+  useEffect(() => {
+    let alive = true;
+    fetchRecords()
+      .then(({ records }) => {
+        if (alive) setCoins(computeCoins(records));
+      })
+      .catch(() => {
+        // 拉取失败保持起始值
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   return (
     <div className="home-wrap">

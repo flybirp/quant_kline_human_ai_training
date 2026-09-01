@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { Period, TrainMode, TrainingConfig } from '../types';
+import { loadKlineMode, saveKlineMode, type KlineMode } from '../lib/klineArt';
 
 interface Props {
   stocks: string[];
@@ -45,6 +46,8 @@ const AI_PROMPT_PRESETS: { label: string; text: string }[] = [
 export default function Settings({ stocks, loading, error, onStart, onBack }: Props) {
   const [mode, setMode] = useState<TrainMode>('random');
   const [code, setCode] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
   const [period, setPeriod] = useState<Period>('day');
   const [positions, setPositions] = useState(2);
   const [maParams, setMaParams] = useState<number[]>([5, 10, 20, 60]);
@@ -53,6 +56,12 @@ export default function Settings({ stocks, loading, error, onStart, onBack }: Pr
   const [slippage, setSlippage] = useState(0.01); // 百分比
   const [stampTax, setStampTax] = useState(0.1); // 百分比
   const [aiPrompt, setAiPrompt] = useState(() => localStorage.getItem(AI_PROMPT_KEY) || '');
+  const [klineMode, setKlineMode] = useState<KlineMode>(() => loadKlineMode());
+
+  function updateKlineMode(m: KlineMode) {
+    setKlineMode(m);
+    saveKlineMode(m);
+  }
 
   function updateAiPrompt(text: string) {
     setAiPrompt(text);
@@ -70,6 +79,12 @@ export default function Settings({ stocks, loading, error, onStart, onBack }: Pr
       mode,
       code: code.trim(),
       period,
+      ...(mode === 'specified'
+        ? {
+            startDate: startDate || undefined,
+            endDate: endDate || undefined,
+          }
+        : {}),
       initialCapital: VIRTUAL_CAPITAL,
       positions: Math.max(1, Math.min(5, positions)),
       maParams: [...maParams].sort((a, b) => a - b),
@@ -82,7 +97,9 @@ export default function Settings({ stocks, loading, error, onStart, onBack }: Pr
   }
 
   const canSubmit =
-    !loading && (mode === 'random' || code.trim().length > 0);
+    !loading &&
+    (mode === 'random' || code.trim().length > 0) &&
+    !(mode === 'specified' && startDate && endDate && startDate > endDate);
 
   return (
     <div className="settings-wrap">
@@ -146,6 +163,75 @@ export default function Settings({ stocks, loading, error, onStart, onBack }: Pr
           </datalist>
         </div>
       )}
+
+      {mode === 'specified' && (
+        <div className="form-group">
+          <label className="form-label">
+            训练区间
+            <span className="form-hint">
+              可选：决策从起始日期当天（或其后首个交易日）开始，结束日期前完成；留空则自动随机
+            </span>
+          </label>
+          <div className="input-row">
+            <div>
+              <label className="form-hint" style={{ margin: '0 0 4px' }}>起始日期</label>
+              <input
+                className="input"
+                type="date"
+                value={startDate}
+                max={endDate || undefined}
+                onChange={(e) => setStartDate(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="form-hint" style={{ margin: '0 0 4px' }}>结束日期</label>
+              <input
+                className="input"
+                type="date"
+                value={endDate}
+                min={startDate || undefined}
+                onChange={(e) => setEndDate(e.target.value)}
+              />
+            </div>
+          </div>
+          {startDate && endDate && startDate > endDate && (
+            <div className="form-hint" style={{ color: 'var(--up)' }}>
+              起始日期不能晚于结束日期
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="form-group">
+        <label className="form-label">
+          AI K线呈现
+          <span className="form-hint">AI 托管决策时，K 线走势以何种形式喂给模型</span>
+        </label>
+        <div className="seg">
+          {(
+            [
+              ['csv', 'CSV数据'],
+              ['chart', '字符形态图'],
+              ['image', '图表截图'],
+            ] as [KlineMode, string][]
+          ).map(([m, label]) => (
+            <button
+              key={m}
+              className={`seg-btn ${klineMode === m ? 'active' : ''}`}
+              onClick={() => updateKlineMode(m)}
+              title={
+                m === 'csv'
+                  ? '数字表格：OHLCV + 涨跌% + 量比 + MA，信息最全，适合纯文本模型'
+                  : m === 'chart'
+                    ? '字符画形态图：阴阳块 + 价格网格 + 量能条，形态直观，适合纯文本模型'
+                    : '把当前周期图表截图发给模型（含MA与成交量），需 LLM 支持多模态'
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <div className="form-group">
         <label className="form-label">K 线周期</label>

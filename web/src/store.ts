@@ -1,7 +1,8 @@
 import type { TrainingRecord } from './types';
 
-const KEY = 'kline-training-records';
-const STAR_KEY = 'kline-starred-records';
+// 旧版 localStorage key：仅用于一次性迁移到服务端
+const LEGACY_KEY = 'kline-training-records';
+const LEGACY_STAR_KEY = 'kline-starred-records';
 
 // 主页「总资金」别名：爆竹coins，起始 10000。它是独立于训练买卖资金的虚拟概念。
 export const INITIAL_COINS = 10000;
@@ -17,41 +18,74 @@ export function computeCoins(records: TrainingRecord[]): number {
   return Math.round(coins * 100) / 100;
 }
 
-export function loadRecords(): TrainingRecord[] {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+export interface RecordsData {
+  records: TrainingRecord[];
+  starred: string[];
+}
+
+async function request<T>(input: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(input, {
+    headers: { 'Content-Type': 'application/json' },
+    ...init,
+  });
+  if (!res.ok) {
+    throw new Error(`记录服务请求失败（${res.status}）`);
   }
+  return (await res.json()) as T;
 }
 
-export function saveRecord(record: TrainingRecord): TrainingRecord[] {
-  const records = [record, ...loadRecords()];
-  localStorage.setItem(KEY, JSON.stringify(records));
-  return records;
+export function fetchRecords(): Promise<RecordsData> {
+  return request<RecordsData>('/api/records');
 }
 
-export function clearRecords(): void {
-  localStorage.removeItem(KEY);
+export async function saveRecord(record: TrainingRecord): Promise<void> {
+  await request('/api/records', {
+    method: 'POST',
+    body: JSON.stringify({ record }),
+  });
 }
 
-export function loadStarred(): string[] {
+export async function clearRecords(): Promise<void> {
+  await request('/api/records', { method: 'DELETE' });
+}
+
+export async function toggleStarred(id: string): Promise<string[]> {
+  const data = await request<{ starred: string[] }>('/api/records/star', {
+    method: 'POST',
+    body: JSON.stringify({ id }),
+  });
+  return data.starred;
+}
+
+// 一次性迁移：把旧版 localStorage 里的记录搬到服务端 JSON 文件后删除本地副本。
+// server 侧已有数据时跳过（避免覆盖），仅清掉本地残留。
+export async function migrateLocalRecords(): Promise<void> {
   try {
-    const raw = localStorage.getItem(STAR_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string') : [];
+    const raw = localStorage.getItem(LEGACY_KEY);
+    if (!raw) return;
+    const local = JSON.parse(raw);
+    if (!Array.isArray(local) || local.length === 0) {
+      localStorage.removeItem(LEGACY_KEY);
+      localStorage.removeItem(LEGACY_STAR_KEY);
+      return;
+    }
+    const server = await fetchRecords();
+    if (server.records.length === 0) {
+      let starred: string[] = [];
+      try {
+        const parsed = JSON.parse(localStorage.getItem(LEGACY_STAR_KEY) || '[]');
+        if (Array.isArray(parsed)) starred = parsed.filter((x) => typeof x === 'string');
+      } catch {
+        starred = [];
+      }
+      await request('/api/records', {
+        method: 'PUT',
+        body: JSON.stringify({ records: local, starred }),
+      });
+    }
+    localStorage.removeItem(LEGACY_KEY);
+    localStorage.removeItem(LEGACY_STAR_KEY);
   } catch {
-    return [];
+    // 迁移失败不阻塞应用（下次启动可重试）
   }
-}
-
-export function toggleStarred(id: string): string[] {
-  const list = loadStarred();
-  const next = list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
-  localStorage.setItem(STAR_KEY, JSON.stringify(next));
-  return next;
 }

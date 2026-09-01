@@ -15,6 +15,8 @@ export interface TrainingConfig {
   mode: TrainMode;
   code: string;
   period: Period;
+  startDate?: string; // 指定模式：决策段起始日期（YYYY-MM-DD），留空随机
+  endDate?: string; // 指定模式：决策段结束日期（YYYY-MM-DD），留空不限
   initialCapital: number; // 虚拟资金基准：仅用于买卖与盈亏计算，与主页「爆竹coins」无关
   positions: number; // 分仓数 1-5
   maParams: number[];

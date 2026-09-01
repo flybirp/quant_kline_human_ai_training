@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { clearRecords, loadRecords, loadStarred, toggleStarred, INITIAL_COINS } from '../store';
+import { clearRecords, fetchRecords, toggleStarred, INITIAL_COINS } from '../store';
 import { downloadTrainingCSV } from '../lib/export';
 import type { TrainingRecord } from '../types';
 
@@ -242,6 +242,11 @@ function RecordItem({ record, starred, onToggleStar }: ItemProps) {
       <div className="ric-head">
         <span className="badge blue">双盲训练</span>
         <span className="ric-name">{record.stockName}</span>
+        {record.startDate && record.endDate && (
+          <span className="ric-range" title="训练行情区间">
+            {record.startDate} ~ {record.endDate}
+          </span>
+        )}
         <span className="ric-time">{fmtDateTime(record.createdAt)}</span>
         <span style={{ flex: 1 }} />
         <button
@@ -273,14 +278,25 @@ function RicCell({ k, v, highlight }: { k: string; v: string; highlight?: 'up' |
 }
 
 export default function Stats({ onBack, onGoTrain }: Props) {
-  const [records, setRecords] = useState<TrainingRecord[]>(() => loadRecords());
-  const [starred, setStarred] = useState<string[]>(() => loadStarred());
+  const [records, setRecords] = useState<TrainingRecord[]>([]);
+  const [starred, setStarred] = useState<string[]>([]);
   const [sort, setSort] = useState<'time' | 'profit'>('time');
 
-  // 切到本页时刷新一次
+  // 切到本页时刷新一次（服务端 JSON 文件）
   useEffect(() => {
-    setRecords(loadRecords());
-    setStarred(loadStarred());
+    let alive = true;
+    fetchRecords()
+      .then(({ records: rs, starred: ss }) => {
+        if (!alive) return;
+        setRecords(rs);
+        setStarred(ss);
+      })
+      .catch(() => {
+        // 拉取失败保持空列表
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const summary = useMemo(() => computeSummary(records), [records]);
@@ -291,10 +307,15 @@ export default function Stats({ onBack, onGoTrain }: Props) {
     return arr.sort((a, b) => b.profitRate - a.profitRate);
   }, [records, sort]);
 
-  function handleClear() {
+  async function handleClear() {
     if (window.confirm('确定清空所有历史训练记录吗？此操作不可撤销。')) {
-      clearRecords();
-      setRecords([]);
+      try {
+        await clearRecords();
+        setRecords([]);
+        setStarred([]);
+      } catch (e) {
+        window.alert(e instanceof Error ? e.message : '清空失败');
+      }
     }
   }
 
@@ -306,8 +327,12 @@ export default function Stats({ onBack, onGoTrain }: Props) {
     downloadTrainingCSV(records);
   }
 
-  function handleToggleStar(id: string) {
-    setStarred(toggleStarred(id));
+  async function handleToggleStar(id: string) {
+    try {
+      setStarred(await toggleStarred(id));
+    } catch (e) {
+      console.error('收藏切换失败', e);
+    }
   }
 
   return (
