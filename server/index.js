@@ -10,7 +10,8 @@ const DATA_DIR =
   path.join(os.homedir(), 'Documents', 'mainland_data_2014');
 
 const app = express();
-app.use(express.json());
+// 图表截图模式：jpeg base64 可达数百 KB，默认 100kb 限制会返回 413
+app.use(express.json({ limit: '10mb' }));
 
 // ---- 简单 LRU 缓存 ----
 class LruCache {
@@ -139,6 +140,16 @@ app.get('/api/kline/:code', (req, res) => {
   res.json({ code, period, count: bars.length, bars });
 });
 
+// 轻量接口：返回某股日线根数（随机抽股预检用，复用 kline 缓存，不做周期聚合）
+app.get('/api/stock-days/:code', (req, res) => {
+  const daily = loadDaily(req.params.code);
+  if (!daily) {
+    res.status(404).json({ error: `未找到股票 ${req.params.code} 的数据` });
+    return;
+  }
+  res.json({ code: req.params.code, days: daily.length });
+});
+
 // ---- 训练记录：JSON 文件存储（server/data/records.json） ----
 const DATA_DIR_PATH = path.dirname(fileURLToPath(import.meta.url));
 const RECORDS_FILE = path.join(DATA_DIR_PATH, 'data', 'records.json');
@@ -218,7 +229,8 @@ function loadLocalEnv() {
   const envPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '.env');
   if (!fs.existsSync(envPath)) return;
   for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    // 变量名兼容连字符写法（如 LLM_MODEL-WITH-VISION），存取时按原样保留
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*$/);
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
   }
 }
@@ -227,6 +239,9 @@ loadLocalEnv();
 const LLM_BASE_URL = (process.env.LLM_BASE_URL || '').replace(/\/+$/, '');
 const LLM_API_KEY = process.env.LLM_API_KEY || '';
 const LLM_MODEL = process.env.LLM_MODEL || '';
+// 多模态模型（图表截图模式）；兼容连字符旧写法 LLM_MODEL-WITH-VISION
+const LLM_MODEL_VISION =
+  process.env.LLM_MODEL_VISION || process.env['LLM_MODEL-WITH-VISION'] || '';
 
 // 从 LLM 回复中容错提取 JSON（可能被 ```json ... ``` 包裹或前后有杂质文字）
 function extractJson(text) {
@@ -270,14 +285,39 @@ app.post('/api/ai/decide', async (req, res) => {
   }
   // 会话 id：一场训练一个（前端生成），用于把流水日志与对账日志关联
   const sid = typeof sessionId === 'string' && sessionId ? sessionId : null;
-  // 图表截图（jpeg base64）：有图时 user 消息转多模态格式，需 LLM 支持视觉输入
-  const img = typeof image === 'string' && image ? image : null;
-  const userContent = img
-    ? [
-        { type: 'text', text: user },
-        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${img}` } },
-      ]
-    : user;
+  // 图表截图（jpeg base64）：日/周/月三周期多图；有图时 user 消息转多模态格式，需 LLM 支持视觉输入
+  const images = Array.isArray(req.body?.images)
+    ? req.body.images.filter((s) => typeof s === 'string' && s)
+    : typeof image === 'string' && image
+      ? [image]
+      : [];
+  // 模型选择：设置页可携带 model / visionModel 覆盖 .env 默认（留空/缺省用 .env）
+  const reqModel = typeof req.body?.model === 'string' && req.body.model.trim() ? req.body.model.trim() : null;
+  const reqVisionModel =
+    typeof req.body?.visionModel === 'string' && req.body.visionModel.trim()
+      ? req.body.visionModel.trim()
+      : null;
+  const useModel = images.length > 0
+    ? (reqVisionModel || LLM_MODEL_VISION)
+    : (reqModel || LLM_MODEL);
+  if (images.length > 0 && !useModel) {
+    res.status(400).json({
+      error: '当前为图表截图模式，但未配置多模态模型：请在训练设置页填写视觉模型，或在 server/.env 添加 LLM_MODEL_VISION，或把「AI K线呈现」切回 CSV/字符形态图',
+    });
+    return;
+  }
+  const userContent =
+    images.length > 0
+      ? [
+          { type: 'text', text: user },
+          ...images.map((b64) => ({
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${b64}` },
+          })),
+        ]
+      : user;
+  // 取证：记录每张截图的 base64 体积（诊断"图内容异常/空白"——正常单张约 60~150KB）
+  const imgSizes = images.map((b64) => b64.length);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30000);
@@ -289,7 +329,7 @@ app.post('/api/ai/decide', async (req, res) => {
         Authorization: `Bearer ${LLM_API_KEY}`,
       },
       body: JSON.stringify({
-        model: LLM_MODEL,
+        model: useModel,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: userContent },
@@ -328,13 +368,15 @@ app.post('/api/ai/decide', async (req, res) => {
         sessionId: sid,
         mode,
         kind,
+        model: useModel,
         usage: data.usage || null,
+        imgSizes,
         system,
         user,
         raw: content || msg.reasoning_content || '',
         output: parsed,
       });
-      res.json(parsed);
+      res.json({ ...parsed, model: useModel });
       return;
     }
 
@@ -360,13 +402,15 @@ app.post('/api/ai/decide', async (req, res) => {
       sessionId: sid,
       mode,
       kind,
+      model: useModel,
       usage: data.usage || null,
+      imgSizes,
       system,
       user,
       raw: content || msg.reasoning_content || '',
       output: payload,
     });
-    res.json(payload);
+    res.json({ ...payload, model: useModel });
   } catch (e) {
     const msg = e.name === 'AbortError' ? 'LLM 请求超时（30s）' : `LLM 请求失败: ${e.message}`;
     res.status(504).json({ error: msg });
@@ -390,6 +434,8 @@ app.post('/api/ai/predict-log', (req, res) => {
     res.status(500).json({ error: `写入日志失败: ${e.message}` });
   }
 });
+
+// ---- 复盘 API 已移除：训练页直接用 record.trades 画买卖点，无需后端参与 ----
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, dataDir: DATA_DIR, stocks: getStockCodes().length });

@@ -6,6 +6,7 @@ import type { TrainingRecord } from '../types';
 interface Props {
   onBack: () => void;
   onGoTrain: () => void;
+  onOpenRecord: (record: TrainingRecord) => void;
 }
 
 // 持仓率/重仓率：单场训练的逐根决策 bar 中状态为 1 的比例
@@ -228,9 +229,10 @@ interface ItemProps {
   record: TrainingRecord;
   starred: boolean;
   onToggleStar: () => void;
+  onOpen: () => void;
 }
 
-function RecordItem({ record, starred, onToggleStar }: ItemProps) {
+function RecordItem({ record, starred, onToggleStar, onOpen }: ItemProps) {
   const hRate = holdingRateOf(record);
   const heavyR = heavyRateOf(record);
   const totalRounds = record.winTrades + record.lossTrades;
@@ -238,7 +240,11 @@ function RecordItem({ record, starred, onToggleStar }: ItemProps) {
   const rangePct = record.rangeReturn * 100;
   const pnlPct = record.profitRate * 100;
   return (
-    <div className="record-item-card">
+    <div
+      className="record-item-card clickable"
+      onClick={onOpen}
+      title="点击进入复盘：重演 K 线揭示过程、买卖点与 AI 决策理由"
+    >
       <div className="ric-head">
         <span className="badge blue">双盲训练</span>
         <span className="ric-name">{record.stockName}</span>
@@ -249,9 +255,13 @@ function RecordItem({ record, starred, onToggleStar }: ItemProps) {
         )}
         <span className="ric-time">{fmtDateTime(record.createdAt)}</span>
         <span style={{ flex: 1 }} />
+        <span className="ric-open-hint">复盘 ▸</span>
         <button
           className={`star-btn ${starred ? 'on' : ''}`}
-          onClick={onToggleStar}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleStar();
+          }}
           aria-label="收藏"
         >
           ★
@@ -277,7 +287,7 @@ function RicCell({ k, v, highlight }: { k: string; v: string; highlight?: 'up' |
   );
 }
 
-export default function Stats({ onBack, onGoTrain }: Props) {
+export default function Stats({ onBack, onGoTrain, onOpenRecord }: Props) {
   const [records, setRecords] = useState<TrainingRecord[]>([]);
   const [starred, setStarred] = useState<string[]>([]);
   const [sort, setSort] = useState<'time' | 'profit'>('time');
@@ -447,6 +457,7 @@ export default function Stats({ onBack, onGoTrain }: Props) {
               record={r}
               starred={starred.includes(r.id)}
               onToggleStar={() => handleToggleStar(r.id)}
+              onOpen={() => onOpenRecord(r)}
             />
           ))}
         </div>

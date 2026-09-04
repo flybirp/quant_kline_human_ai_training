@@ -35,8 +35,30 @@ export interface Trade {
   actor?: 'human' | 'ai'; // 该笔交易由人还是 AI 执行（AI 托管模式）
 }
 
+// 训练环境快照：归因分析用（哪版策略/模型/规则下跑出的成绩）。
+// AI 决策明细不在这里——按 sessionId 关联 server/logs/ai-decide.jsonl 全量可查。
+export interface RecordMeta {
+  // 设置页快照
+  aiPrompt: string; // AI 策略指令（策略本体）
+  riskGuide: string; // 风控指引
+  klineMode: 'csv' | 'chart' | 'image'; // AI K线呈现方式
+  positions: number; // 分仓数
+  maParams: number[]; // 均线参数
+  decisionBars: number; // 决策根数
+  feeRate: number; // 手续费（小数，如 0.0003）
+  slippage: number; // 滑点（小数）
+  stampTax: number; // 印花税（小数）
+  // 训练页/环境信息
+  aiMode: 'step' | 'pred_wait'; // AI 托管模式
+  llmModel: string; // 实际使用的 LLM 模型（server 回传）
+  ruleVersion: number; // 交易规则版本（lib/limit.ts RULE_VERSION，跨版本成绩不可比）
+  // 预测对错汇总（唯一留存点：原材料 daySeg 不落库，不存即丢失）
+  predStats?: { total: number; hit: number; bullishMiss: number; bearishMiss: number };
+}
+
 export interface TrainingRecord {
   id: string;
+  sessionId?: string; // 与 server/logs/ai-decide.jsonl、ai-predict.jsonl 的关联键
   code: string;
   stockName: string;
   period: Period;
@@ -55,5 +77,6 @@ export interface TrainingRecord {
   heavySeries: number[]; // 决策段每根 bar 是否重仓（>=60% 资金占用）0/1
   durationMs: number; // 训练耗时（ms）
   mode?: 'manual' | 'ai' | 'mixed'; // 人工 / AI 托管 / 人机混合
+  meta?: RecordMeta; // 训练环境快照（旧记录无此字段）
   createdAt: number;
 }

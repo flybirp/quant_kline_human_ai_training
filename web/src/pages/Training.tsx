@@ -20,16 +20,22 @@ import type { Bar, Period, Trade, TrainingConfig, TrainingRecord } from '../type
 import { codeToStockName } from '../lib/stock';
 import {
   buildOutcome,
+  buildPredReview,
   buildPredictionUserPrompt,
   buildWakeUserPrompt,
   checkTriggers,
   disciplineBlock,
   emptyDiscipline,
+  emptyPredStats,
   normalizePrediction,
-  PRED_WAIT_SYSTEM_PROMPT,
+  buildPredWaitSystemPrompt,
+  renderPredStats,
 } from '../lib/predWait';
-import type { Discipline, Prediction, PredWakeEvent } from '../lib/predWait';
-import { klineAsciiBlock, loadKlineMode, type KlineMode } from '../lib/klineArt';
+import type { Discipline, Prediction, PredStats, PredWakeEvent } from '../lib/predWait';
+import { gapBetween, klineAsciiBlock, loadKlineMode, type KlineMode } from '../lib/klineArt';
+import { loadAiMode, loadAiModels, loadAiRiskGuide, loadAiTradeBudget, renderRiskGuide } from '../lib/aiSettings';
+import { atrPct, patternSummaryBlock } from '../lib/patterns';
+import { limitStateOf, RULE_VERSION, WARMUP_MIN_BARS } from '../lib/limit';
 import AiLogPanel from '../components/AiLogPanel';
 import { makeId } from '../lib/aiMessages';
 import type { AiMessage } from '../lib/aiMessages';
@@ -62,6 +68,9 @@ interface Props {
   config: TrainingConfig;
   onFinish: (record: TrainingRecord) => void;
   onExit: () => void;
+  /** 历史记录还原：loadSegment 完成后注入 record 的 trades 并定位到 record.endDate，
+   *  AI 托管默认关闭，用户可手动继续点「下一步」看未来 K 线 */
+  replayRecord?: TrainingRecord;
 }
 
 function toTimestamp(date: string): UTCTimestamp {
@@ -132,6 +141,12 @@ function calcKDJ(bars: Bar[]) {
 // 各周期喂给 LLM 的 K 线截断长度（日/周/月统一）
 const AI_CONTEXT_BARS = 80;
 
+// 图表视图容量（三周期统一）：每个周期首次渲染时锚定「最近 280 根的首根」为左缘，
+// 此后钉死、右缘随揭示推进生长（初始 ~180 根容量 + 101 决策 ≈ 281）。
+// 周线/月线同容量意味着展示等量的更早历史（数据源本就含全部历史）——大级别才有看的意义；
+// 也修复截图切换周期时 spacing 被撑大不复位的问题（"180根突变30根"）。
+const VIEW_BARS = 280;
+
 // s1：系统 prompt——角色 + 双盲约束 + 合法动作 + 交易纪律 + 输出格式
 const AI_SYSTEM_PROMPT = `你是一名纪律严谨的A股交易员，正在「双盲K线回放训练」系统中逐根K线做交易决策。
 
@@ -145,7 +160,9 @@ const AI_SYSTEM_PROMPT = `你是一名纪律严谨的A股交易员，正在「�
 
 交易纪律：
 - 交易存在手续费、滑点与印花税，频繁交易会被成本磨损。
+- 本局你只有有限的开仓机会（上下文中实时显示剩余额度）：1次机会=1个完整的仓位回合（从空仓建仓到清仓，回合内分批加仓/减仓不另耗机会），用尽后不能再开新回合，只能管理现有持仓或观望——把每个回合当作稀缺资源，只建立在高质量信号上。
 - 优先控制回撤，其次追求收益；没有明确把握时果断观望。
+- 交易限制：收盘涨停的K线不可买入（封板挂单无法成交），收盘跌停的K线不可卖出；下单前先看当日涨跌停状态——在涨跌停日下被禁方向的订单会被系统拒绝并记为失误。
 - 善用分仓机制：分仓的意义在于分批进出，而非一次性满仓或空仓。
   - 持仓后回调不急于动作：若中长期趋势未破坏（回踩均线支撑、缩量企稳），此时用剩余份数补仓摊低成本比一味观望更值得执行——这正是保留现金份的意义；
   - 补仓的前提是趋势未坏：跌破关键支撑且放量下杀时止损离场，不要越跌越买；
@@ -166,13 +183,22 @@ interface AiContext {
   daily: AiBarRow[]; // 已截断的日级 K 线（隐藏日期，用序号）
   weekly: AiBarRow[]; // 由已揭示日线聚合的周级 K 线
   monthly: AiBarRow[]; // 由已揭示日线聚合的月级 K 线
+  allDaily: Bar[]; // 全量已揭示日线（不截断，形态特征检测用：60根窗口结构需要更长前置数据）
+  tradeBudgetUsed: number; // AI 已消耗的开仓机会
+  tradeBudgetTotal: number; // AI 开仓机会总预算
   recent20Change: number; // 近20根日线涨跌幅
   recent20Drawdown: number; // 近20根日线区间最大回撤（正值）
   volumeRatio: number; // 最新日线量 / 前20根日均量
+  atr14: number | null; // ATR14 日均真实波幅（占价格%）：波动正常性基准
+  todayRangePct: number | null; // 最新日线振幅（%）
+  avgVol20: number; // 20日均量（绝对值）：流动性/冷门程度基准（量比只是相对值）
   logs: string[]; // s3：近期决策记忆（含理由）
   discipline: Discipline; // 交易纪律短期记忆（本场行为统计与犯错记录）
   klineMode: KlineMode; // K 线呈现方式：csv / chart / image
-  klineImage?: string; // image 模式：图表截图（jpeg base64，无 dataURL 前缀）
+  klineImages?: string[]; // image 模式：日/周/月三周期截图（jpeg base64，无 dataURL 前缀）
+  totalBars: number; // 本场决策总根数
+  decidedBars: number; // 当前已进行到的决策根序号（1-based）
+  limitState: 'up' | 'down' | null; // 当日涨跌停状态（涨停禁买 / 跌停禁卖）
 }
 
 // K 线行：附带 MA5/20/60（基于全量已揭示数据计算，截取窗口后边界值依然准确）
@@ -254,6 +280,8 @@ function klineBlock(title: string, rows: AiBarRow[], tailNote: string): string[]
       `${i + 1},${fmt2(r.bar.open)},${fmt2(r.bar.high)},${fmt2(r.bar.low)},${fmt2(r.bar.close)},${(r.pct * 100).toFixed(1)},${Math.round(r.bar.volume)},${r.volRatio.toFixed(2)},${fmtMa(r.ma5)},${fmtMa(r.ma20)},${fmtMa(r.ma60)}`,
     );
   });
+  const gap = gapSummary(rows.map((r) => r.bar));
+  if (gap) lines.push(gap);
   return lines;
 }
 
@@ -270,6 +298,12 @@ function buildAiUserPrompt(ctx: AiContext): string {
 
   lines.push('【持仓状态】');
   lines.push(`总仓分 ${ctx.positions} 份；当前持有 ${ctx.lots} 份股票、${maxBuy} 份现金`);
+  // 开仓机会预算（稀缺性提示，实时递减；单位=仓位回合）
+  if (ctx.tradeBudgetUsed >= ctx.tradeBudgetTotal) {
+    lines.push(`⏳ 开仓机会已用尽（${ctx.tradeBudgetUsed}/${ctx.tradeBudgetTotal}）：不能再开新的仓位回合，只能管理现有持仓（加仓/减仓/平仓）或观望。`);
+  } else {
+    lines.push(`⏳ 开仓机会：剩余 ${ctx.tradeBudgetTotal - ctx.tradeBudgetUsed}/${ctx.tradeBudgetTotal} 个仓位回合（1次机会=从空仓建仓到清仓的完整回合；回合内分批加仓/减仓不另耗机会，如分仓${ctx.positions}时每回合可含${ctx.positions}次买入+${ctx.positions}次卖出）。用尽后不能再开新回合。开仓前自问：这个信号值得占用所剩的机会吗？弱信号宁可放过。`);
+  }
   if (ctx.lots > 0) {
     lines.push(
       `持仓均价 ${fmt2(ctx.avgCost)}，最新收盘 ${fmt2(ctx.price)}，浮动盈亏 ${(ctx.floatPnlRate * 100).toFixed(1)}%`,
@@ -278,11 +312,36 @@ function buildAiUserPrompt(ctx: AiContext): string {
     lines.push(`当前空仓，最新收盘 ${fmt2(ctx.price)}`);
   }
   const actions: string[] = [];
-  if (maxBuy > 0) actions.push(`买入 1~${maxBuy} 份`);
-  if (ctx.lots > 0) actions.push(`卖出 1~${ctx.lots} 份`);
+  if (maxBuy > 0 && ctx.limitState !== 'up') actions.push(`买入 1~${maxBuy} 份`);
+  if (ctx.lots > 0 && ctx.limitState !== 'down') actions.push(`卖出 1~${ctx.lots} 份`);
   actions.push('观望');
   lines.push(`本根合法动作：${actions.join(' / ')}`);
+  if (ctx.limitState === 'up') {
+    lines.push('⚠ 今日收盘涨停（封板，禁止买入；卖出不受限）');
+  } else if (ctx.limitState === 'down') {
+    lines.push('⚠ 今日收盘跌停（禁止卖出；买入不受限）');
+  }
   lines.push('');
+
+  // 训练进度：AI 需要知道剩余根数（临近结束避免开新仓、主动平仓落袋）
+  {
+    const remain = Math.max(0, ctx.totalBars - ctx.decidedBars);
+    lines.push('【训练进度】');
+    lines.push(
+      `本场共需决策 ${ctx.totalBars} 根日K，当前第 ${ctx.decidedBars} 根，剩余 ${remain} 根` +
+        (remain <= 10
+          ? '；已临近结束：训练结束按最新收盘价对持仓估值结算，浮盈不会自动落袋，如需锁定利润应主动平仓；开新仓条件收紧（非禁止）——仅当出现高置信信号（如放量反转大阳、深跌出清确认、区间突破站稳）且预计持有期可在剩余根数内走完时，才可轻仓（1份）短线参与，否则不开新仓'
+          : ''),
+    );
+    lines.push('');
+  }
+
+  // 用户设定的风控指引（自由文本，决策参考，非强制）
+  const riskGuide = renderRiskGuide(loadAiRiskGuide());
+  if (riskGuide) {
+    lines.push(riskGuide);
+    lines.push('');
+  }
 
   // 交易纪律短期记忆：让 AI 看到自己本场的交易行为统计与犯错记录
   lines.push(...disciplineBlock(ctx.discipline));
@@ -296,8 +355,8 @@ function buildAiUserPrompt(ctx: AiContext): string {
   lines.push('');
 
   // 多周期走势：按用户配置的呈现方式输出（csv 数字表 / chart 字符形态图 / image 附图说明）
-  if (ctx.klineMode === 'image' && ctx.klineImage) {
-    lines.push('【K线走势】见本消息附带的图表截图（当前周期视图，含均线与成交量副图；请结合图判断走势，周/月线结构参考下方市场统计）');
+  if (ctx.klineMode === 'image' && ctx.klineImages && ctx.klineImages.length > 0) {
+    lines.push('【K线走势】见本消息附带的图表截图（共' + ctx.klineImages.length + '张：日线、周线、月线各一张，均含均线与成交量副图；图片左上角有颜色图例：红K线=阳线、绿K线=阴线、副图量能柱同色规则、各颜色均线对应 MA 参数；相邻K线之间的浅灰色带为跳空缺口）。K线规律是分形的：分型/背离/区间/趋势在日、周、月线上同样适用——大级别信号更可靠（噪音少、共识更强），小级别信号更及时；用周/月线的同一套形态语言判断方向与信号质量，用日线执行时机，两者矛盾时相信大级别。');
     lines.push('');
   } else if (ctx.klineMode === 'chart') {
     lines.push(...klineAsciiBlock('【已揭示K线 · 日线 · 形态图】', ctx.daily.map((r) => r.bar), ''));
@@ -325,10 +384,28 @@ function buildAiUserPrompt(ctx: AiContext): string {
   }
 
   lines.push('【市场统计】（基于日线）');
-  lines.push(
-    `近20根涨跌 ${(ctx.recent20Change * 100).toFixed(1)}%，区间最大回撤 ${(ctx.recent20Drawdown * 100).toFixed(1)}%，最新量/前20根均量 = ${ctx.volumeRatio.toFixed(2)}`,
-  );
+  {
+    const turnover = ctx.avgVol20 * ctx.price; // 20日均量×收盘价 ≈ 20日平均成交额
+    const fmtTo = turnover >= 1e8 ? `${(turnover / 1e8).toFixed(1)}亿` : `${Math.round(turnover / 1e4).toLocaleString()}万`;
+    lines.push(
+      `近20根涨跌 ${(ctx.recent20Change * 100).toFixed(1)}%，区间最大回撤 ${(ctx.recent20Drawdown * 100).toFixed(1)}%；最新量 ${Math.round(ctx.volumeRatio * ctx.avgVol20).toLocaleString()}、20日均量 ${Math.round(ctx.avgVol20).toLocaleString()}（量比 ${ctx.volumeRatio.toFixed(2)}），20日均成交额 ≈ ${fmtTo}（均量×股价——资金关注度的真实标尺，手数会骗人而钱不会：日均亿级=主力资金活跃，千万级=中等关注，百万级以下=冷门；冷门+缩量地量后的大波段历史期望更高，但需承受流动性差的价格操纵风险）`,
+    );
+  }
+  if (ctx.atr14 != null) {
+    const atrNote =
+      ctx.todayRangePct != null
+        ? `（今日振幅 ${ctx.todayRangePct.toFixed(1)}% = ${(ctx.todayRangePct / ctx.atr14).toFixed(1)}倍ATR${ctx.todayRangePct > ctx.atr14 * 2 ? '，异常放大——多为变盘/出清/洗盘信号，勿以日常波动视之' : '，属正常波动范围'}）`
+        : '';
+    lines.push(`日均真实波幅 ATR14 = ${ctx.atr14.toFixed(2)}%——这是该股的正常波动基准${atrNote}`);
+  }
   lines.push('');
+
+  // 形态特征（quant_discover 统计先验的程序判定，全量已揭示日线，仅因果数据）
+  const patternBlock = patternSummaryBlock(ctx.allDaily);
+  if (patternBlock) {
+    lines.push(...patternBlock);
+    lines.push('');
+  }
 
   lines.push('请基于以上多周期走势给出本根K线收盘后的决策，只输出 JSON。');
   return lines.join('\n');
@@ -401,7 +478,7 @@ function alignToPeriodStart(daySeg: Bar[], dayWarmup: number, period: Period): n
   return i;
 }
 
-export default function Training({ config, onFinish, onExit }: Props) {
+export default function Training({ config, onFinish, onExit, replayRecord }: Props) {
   const [period, setPeriod] = useState<Period>(config.period);
   const [maParams, setMaParams] = useState<number[]>(config.maParams);
   const [indicators, setIndicators] = useState({
@@ -429,9 +506,10 @@ export default function Training({ config, onFinish, onExit }: Props) {
   // ---- AI 托管 ----
   const [aiAuto, setAiAuto] = useState(false); // 托管开关
   const [aiDeciding, setAiDeciding] = useState(false); // 是否正在等待 LLM 返回
+  const [aiCapturing, setAiCapturing] = useState(false); // image 模式多周期截图进行中（图表区加蒙层遮住切换闪烁）
   const [aiSpeed, setAiSpeed] = useState(1500); // 每步间隔 ms
   const [aiError, setAiError] = useState('');
-  const [aiMode, setAiMode] = useState<'step' | 'pred_wait'>('step'); // 逐根 / 预测等待
+  const [aiMode, setAiMode] = useState<'step' | 'pred_wait'>(() => loadAiMode()); // 逐根 / 预测等待（设置页配置）
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([]); // AI 回复区渲染消息（与 aiLogsRef 分离）
   const decidingRef = useRef(false); // 防重入
   const aiLogsRef = useRef<string[]>([]); // 决策记忆滚动窗口（借鉴 FinMem 分层记忆）
@@ -443,7 +521,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
   const aiDecideRef = useRef<() => void>(() => {}); // 指向最新渲染的决策函数，避免闭包过期
 
   // ---- pred_and_wait 模式专用状态/ref ----
-  const aiModeRef = useRef<'step' | 'pred_wait'>('step');
+  const aiModeRef = useRef<'step' | 'pred_wait'>(loadAiMode());
   const pwTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pwTickFnRef = useRef<() => void>(() => {});
   const predictionRef = useRef<Prediction | null>(null); // 当前预测（空 = 尚未预测）
@@ -468,6 +546,13 @@ export default function Training({ config, onFinish, onExit }: Props) {
   }, [lots, config.positions]);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const replayStartLineRef = useRef<HTMLDivElement>(null);
+  const replayEndLineRef = useRef<HTMLDivElement>(null);
+  // 视口左缘锚（按周期记录）：首次渲染时定为「最近 VIEW_BARS 根的首根」，此后不动
+  const viewAnchorRef = useRef<Record<Period, number | null>>({ day: null, week: null, month: null });
+  // AI 开仓机会预算（稀缺性约束）：AI 的 buy 成交时扣 1，用尽后 AI 的 buy 强制转观望；
+  // 平仓/止损不受限（风控优先）；人工操作不受限（预算只约束 AI）
+  const tradeBudgetUsedRef = useRef(0);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const auxSeriesRef = useRef<ISeriesApi<any>[]>([]);
@@ -501,11 +586,15 @@ export default function Training({ config, onFinish, onExit }: Props) {
   // 本次训练会话 id：decide 流水日志与 predict 对账日志共用，
   // 便于把一场训练在两个 jsonl 里的记录关联起来
   const sessionIdRef = useRef(String(Date.now()));
+  // 本场实际使用的 LLM 模型（server 响应回传，records.meta 归因用）
+  const sessionModelRef = useRef('');
 
   // 交易纪律短期记忆：本场开仓/平仓/费用统计（喂回 AI 用于自我纠错）
   const disciplineRef = useRef<Discipline>(emptyDiscipline(config.initialCapital));
   // 预测有效期历史（检测 AI 是否机械重复同一 horizon）
   const horizonHistoryRef = useRef<number[]>([]);
+  // 跨轮预测战绩：让 AI 知道自己的人设/策略在当前个股与时段上是否适用
+  const predStatsRef = useRef<PredStats>(emptyPredStats());
 
   // ---- 数据加载（只预加载日线全量，周/月线由前端本地折叠）----
   const loadSegment = useCallback(
@@ -514,10 +603,10 @@ export default function Training({ config, onFinish, onExit }: Props) {
       setLoadError('');
       try {
         const dayFull = await fetchKline(code, 'day');
-        const totalMin = decisionBars + FUTURE_BARS;
+        const totalMin = WARMUP_MIN_BARS + decisionBars;
         if (dayFull.length < totalMin) {
           throw new Error(
-            `${code} 的日线只有 ${dayFull.length} 根，至少需要 ${totalMin} 根才能训练`,
+            `${code} 的日线只有 ${dayFull.length} 根，至少需要 ${totalMin} 根（预热 ${WARMUP_MIN_BARS} + 决策 ${decisionBars}）才能训练`,
           );
         }
 
@@ -541,13 +630,24 @@ export default function Training({ config, onFinish, onExit }: Props) {
           );
         }
 
-        // 决策段起点：指定了起始日期 → 定位到该日（或其后首个交易日）；否则在区间内随机
+        // 决策段起点：指定了起始日期 → 定位到该日（或其后首个交易日）；否则在区间内随机。
+        // 预热下限：起点前至少保留 WARMUP_MIN_BARS 根日线作为观察窗口
         let start: number;
         if (hasRange && config.startDate) {
+          if (rangeStart < WARMUP_MIN_BARS) {
+            throw new Error(
+              `起始日期过早：该日之前只有 ${rangeStart} 根日线，不足 ${WARMUP_MIN_BARS} 根预热观察窗口，请把起始日期推后`,
+            );
+          }
           start = rangeStart;
         } else {
           const maxStart = Math.min(dayFull.length - decisionBars - 1, rangeEndIdx - decisionBars + 1);
-          start = Math.floor(Math.random() * (maxStart + 1));
+          if (maxStart < WARMUP_MIN_BARS) {
+            throw new Error(
+              `${code} 可用区间过短，无法同时满足 ${WARMUP_MIN_BARS} 根预热与 ${decisionBars} 根决策`,
+            );
+          }
+          start = WARMUP_MIN_BARS + Math.floor(Math.random() * (maxStart - WARMUP_MIN_BARS + 1));
         }
         // 复盘用的未来数据：有结束日期时不得越过区间
         const futureLimit = hasRange && config.endDate ? rangeEndIdx + 1 : dayFull.length;
@@ -564,6 +664,52 @@ export default function Training({ config, onFinish, onExit }: Props) {
         setTrades([]);
         setClosedRounds([]);
         setFinished(false);
+        tradeBudgetUsedRef.current = 0; // 开仓机会预算：每场训练重置
+        // 复盘模式：注入历史记录里的全部交易，并把决策推进到 record.endDate。
+        // 幂等执行（不用一次性 ref）：StrictMode 下 loadSegment 会双跑，第二次的重置
+        // 必须跟着重新注入，否则复盘状态被清空（进度归零、买卖点消失）
+        if (replayRecord) {
+          setTrades(replayRecord.trades);
+          const iEnd = seg.findIndex((b) => b.date >= replayRecord.endDate);
+          setDayVisible(iEnd >= 0 ? iEnd + 1 : seg.length);
+          // 按记录里的成交序列重放，还原训练结束时的资金/持仓状态
+          // （费用口径与 doAction 完全一致：买入 n*price*(1+fee)，卖出 gross*(1-fee-tax)，滑点已含在成交价中）
+          let rCash = config.initialCapital;
+          let rShares = 0;
+          let rAvg = 0;
+          let rLots = 0;
+          const lotCash = config.initialCapital / config.positions;
+          for (const t of replayRecord.trades) {
+            if (t.side === 'buy') {
+              const cost = t.shares * t.price * (1 + config.feeRate);
+              const newShares = rShares + t.shares;
+              rAvg = newShares > 0 ? (rAvg * rShares + cost) / newShares : 0;
+              rCash -= cost;
+              rShares = newShares;
+              rLots += Math.max(1, Math.round(cost / lotCash));
+            } else if (rShares > 0) {
+              const net = t.shares * t.price * (1 - config.feeRate - config.stampTax);
+              // 卖出份数未入记录，按股数比例反推（round(shares*wanted/lots) 的逆运算，误差至多 1 份，不影响资金精度）
+              const sellLots = rLots > 0 ? Math.max(1, Math.round((t.shares * rLots) / rShares)) : 1;
+              rCash += net;
+              rShares -= t.shares;
+              rLots = Math.max(0, rLots - sellLots);
+              if (rShares <= 0) {
+                rShares = 0;
+                rLots = 0;
+                rAvg = 0;
+              }
+            }
+          }
+          setCash(rCash);
+          setShares(rShares);
+          setAvgCost(rAvg);
+          setLots(rLots);
+          cashRef.current = rCash;
+          sharesRef.current = rShares;
+          avgCostRef.current = rAvg;
+          lotsRef.current = rLots;
+        }
         cashRef.current = config.initialCapital;
         sharesRef.current = 0;
         avgCostRef.current = 0;
@@ -572,6 +718,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
         heavySeriesRef.current = [];
         disciplineRef.current = emptyDiscipline(config.initialCapital);
         horizonHistoryRef.current = [];
+        predStatsRef.current = emptyPredStats();
       } catch (e) {
         setLoadError(e instanceof Error ? e.message : String(e));
       } finally {
@@ -593,6 +740,8 @@ export default function Training({ config, onFinish, onExit }: Props) {
 
   function handlePeriodChange(p: Period) {
     if (p === period || finished) return;
+    // 复盘模式禁止切周期：alignToPeriodStart 会改写 dayWarmup，破坏复盘还原的定位
+    if (replayRecord) return;
     // 预测等待托管中禁止切周期：会改变决策段起点 dayWarmup，导致天级推进边界错乱
     if (aiAuto && aiMode === 'pred_wait') return;
     // 切换周期：仅切换显示/决策粒度，并对齐决策段起点到周期边界（周/月开头）。
@@ -613,6 +762,32 @@ export default function Training({ config, onFinish, onExit }: Props) {
   function toggleIndicator(key: 'volume' | 'macd' | 'kdj') {
     setIndicators((prev) => ({ ...prev, [key]: !prev[key] }));
   }
+
+  // 复盘模式：训练起终点竖直虚线定位（timeScale 时间→x 坐标；滚动/缩放后由订阅回调刷新）
+  const replayLineFnRef = useRef<() => void>(() => {});
+  function updateReplayLines() {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const setLine = (el: HTMLDivElement | null, date?: string) => {
+      if (!el) return;
+      if (!replayRecord || !date) {
+        el.style.display = 'none';
+        return;
+      }
+      const x = chart!.timeScale().timeToCoordinate(toTimestamp(date));
+      if (x == null) {
+        el.style.display = 'none'; // 滚出可视范围时隐藏
+        return;
+      }
+      el.style.display = 'block';
+      el.style.left = `${x}px`;
+    };
+    setLine(replayStartLineRef.current, replayRecord?.startDate);
+    setLine(replayEndLineRef.current, replayRecord?.endDate);
+  }
+  useEffect(() => {
+    replayLineFnRef.current = updateReplayLines;
+  });
 
   // 已揭示的日线折叠成当前周期（周/月只保留完整周期），供图表渲染与决策使用
   const displayBars = useMemo<FoldedBar[]>(() => {
@@ -717,8 +892,13 @@ export default function Training({ config, onFinish, onExit }: Props) {
     };
     chart.subscribeCrosshairMove(onCrosshairMove);
 
+    // 复盘模式：图表滚动/缩放时刷新起终点虚线位置（经 ref 调用最新版本）
+    const onRangeChange = () => replayLineFnRef.current();
+    chart.timeScale().subscribeVisibleTimeRangeChange(onRangeChange);
+
     return () => {
       chart.unsubscribeCrosshairMove(onCrosshairMove);
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(onRangeChange);
       markersPluginRef.current?.detach();
       chart.remove();
       chartRef.current = null;
@@ -910,15 +1090,21 @@ export default function Training({ config, onFinish, onExit }: Props) {
       .filter((m): m is SeriesMarker<Time> => m != null);
     markersPluginRef.current?.setMarkers(markers);
 
-    // 数据充足时滚动到最新，保持固定 K 线宽度；
-    // 数据不足填满宽度时改为铺满整屏，避免右侧拥挤、左侧大片空白。
-    const container = containerRef.current;
-    const minBarsToFill = container ? Math.ceil(container.clientWidth / 6) : 50;
-    if (shown.length >= minBarsToFill) {
-      chart.timeScale().scrollToRealTime();
-    } else {
-      chart.timeScale().fitContent();
+    // 显示区域左缘钉死 + 右缘生长（三周期统一 VIEW_BARS 容量）：
+    // 每个周期首次渲染时把左缘锚定在「最近 280 根的首根」，此后不动——
+    // 训练推进时新 K 线加在右侧（初始容量 + 决策根数）；周/月线同容量展示等量更早历史。
+    // 替代 scrollToRealTime/fitContent：滚动跟随会让左侧滚出视口，且周/月截图切换时
+    // fitContent 撑大 spacing 后切回日线不复位（"180根突变30根"）。
+    const anchor = viewAnchorRef.current[period];
+    if (anchor == null) {
+      viewAnchorRef.current[period] = Math.max(0, shown.length - VIEW_BARS);
     }
+    const from = viewAnchorRef.current[period] ?? 0;
+    chart.timeScale().setVisibleLogicalRange({
+      from,
+      to: Math.max(shown.length - 1 + 3, from + 30), // 末端留 3 根空白；数据极少时避免过度放大
+    });
+    updateReplayLines(); // 复盘模式：数据更新后重定位起终点虚线
   }, [displayBars, maParams, trades, indicators]);
 
   // 揭晓后追加显示未来 K 线（含决策段之后的未来周期）：
@@ -984,6 +1170,36 @@ export default function Training({ config, onFinish, onExit }: Props) {
     const actor = opts?.actor ?? 'human';
 
     if (side === 'buy') {
+      // 开仓机会预算（仅约束 AI，单位=仓位回合）：
+      // 从空仓建立新仓位消耗 1 次机会；回合内加仓（已持仓再买）不另耗。
+      // 用尽后不能再开新回合（空仓 buy 拒绝），已有回合内的加仓/减仓/平仓不受限。
+      const isNewRound = lotsRef.current <= 0;
+      if (actor === 'ai' && isNewRound && tradeBudgetUsedRef.current >= loadAiTradeBudget()) {
+        aiLogsRef.current.push('[预算用尽] 开仓机会已用完，不能再开新仓位回合（现有持仓的加/减/平仓不受限）');
+        setAiMessages((prev) => [
+          ...prev,
+          { id: makeId(), ts: Date.now(), kind: 'notice', text: '开仓机会已用尽：新开仓自动转观望（管理现有持仓不受限）' },
+        ]);
+        if (aiModeRef.current === 'pred_wait' && actor === 'ai') {
+          advanceDay();
+        } else {
+          advance();
+        }
+        return;
+      }
+      // 涨跌停约束：收盘涨停禁买（封板买不进）。AI 撞禁令 → 不成交但决策已发生（记录并推进）
+      const lockedUp = limitStateOf(daySegRef.current, dayVisibleRef.current - 1, config.code) === 'up';
+      if (lockedUp) {
+        if (actor === 'ai') {
+          aiUsedRef.current = true;
+          disciplineRef.current.blockedCount += 1;
+          aiLogsRef.current.push('[涨停封板，买入未执行] 收盘涨停无法买入，已自动转观望');
+          setAiMessages((prev) => [
+            ...prev,
+            { id: makeId(), ts: Date.now(), kind: 'notice', text: '买入被拒：今日收盘涨停（封板）' },
+          ]);
+        }
+      } else {
       // 分仓买入：按份数买入（人工用选择器值，AI 直接传参；执行时仍 clamp 保证合法）
       if (lotsRef.current >= config.positions || currentPrice <= 0) return;
       const lotCash = config.initialCapital / config.positions;
@@ -1002,6 +1218,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
       const gainedLots = Math.max(1, Math.min(wantLots, Math.round(cost / lotCash)));
       commitCash(cashRef.current - cost);
       commitPosition(newShares, newAvg, lotsRef.current + gainedLots);
+      if (actor === 'ai' && isNewRound) tradeBudgetUsedRef.current += 1; // AI 空仓建新回合消耗 1 次机会
       // 纪律记忆：开仓次数 + 买入手续费（滑点已含在成交价中）
       disciplineRef.current.openCount += 1;
       disciplineRef.current.feesPaid += n * buyPrice * config.feeRate;
@@ -1009,7 +1226,21 @@ export default function Training({ config, onFinish, onExit }: Props) {
         ...prev,
         { side: 'buy', price: buyPrice, shares: n, date: currentBar.date, index: displayBars.length - 1, actor },
       ]);
+      }
     } else if (side === 'sell') {
+      // 涨跌停约束：收盘跌停禁卖（跌停挂单成交不了）。AI 撞禁令 → 不成交但决策已发生（记录并推进）
+      const lockedDown = limitStateOf(daySegRef.current, dayVisibleRef.current - 1, config.code) === 'down';
+      if (lockedDown) {
+        if (actor === 'ai') {
+          aiUsedRef.current = true;
+          disciplineRef.current.blockedCount += 1;
+          aiLogsRef.current.push('[跌停封死，卖出未执行] 收盘跌停无法卖出，已自动转观望');
+          setAiMessages((prev) => [
+            ...prev,
+            { id: makeId(), ts: Date.now(), kind: 'notice', text: '卖出被拒：今日收盘跌停（封死）' },
+          ]);
+        }
+      } else {
       // 分仓卖出：按份数卖出（持仓等分），人工用选择器值，AI 直接传参
       if (sharesRef.current <= 0) return;
       const sellLotsWanted = Math.min(opts?.lots ?? sellLots, lotsRef.current);
@@ -1051,6 +1282,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
         ...prev,
         { side: 'sell', price: sellPrice, shares: sellShares, date: currentBar.date, index: displayBars.length - 1, actor },
       ]);
+      }
     }
 
     // pred_and_wait 下 AI 动作按「天」推进；人工/step 保持周期推进
@@ -1113,6 +1345,182 @@ export default function Training({ config, onFinish, onExit }: Props) {
 
   // ---- AI 托管：上下文构造与决策循环 ----
 
+  // 截取完整图表：lightweight-charts v5 的主图与副图 pane 是独立 canvas，
+  // takeScreenshot() 只覆盖 pane 0，这里把容器内所有 canvas 按位置合成一张
+  function captureChartImage(): string | undefined {
+    const container = containerRef.current;
+    if (!container) return undefined;
+    const canvases = Array.from(container.querySelectorAll('canvas'));
+    if (canvases.length === 0) return undefined;
+    const c0 = canvases[0];
+    const c0Rect = c0.getBoundingClientRect();
+    const dpr = c0Rect.width > 0 ? c0.width / c0Rect.width : 1;
+    const rect = container.getBoundingClientRect();
+    const out = document.createElement('canvas');
+    out.width = Math.max(1, Math.round(rect.width * dpr));
+    out.height = Math.max(1, Math.round(rect.height * dpr));
+    const ctx = out.getContext('2d');
+    if (!ctx) return undefined;
+    // 底色填充（canvas 透明区域合成后需要背景）
+    const bg = getComputedStyle(container).backgroundColor;
+    ctx.fillStyle = !bg || bg === 'rgba(0, 0, 0, 0)' ? '#161b22' : bg;
+    ctx.fillRect(0, 0, out.width, out.height);
+    for (const c of canvases) {
+      const r = c.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      ctx.drawImage(
+        c,
+        Math.round((r.left - rect.left) * dpr),
+        Math.round((r.top - rect.top) * dpr),
+        Math.round(r.width * dpr),
+        Math.round(r.height * dpr),
+      );
+    }
+
+    // 跳空缺口：相邻两根 bar 之间画浅灰色带（用图表坐标 API 定位，画在缩放之前）
+    const chart = chartRef.current;
+    const candle = candleRef.current;
+    if (chart && candle && displayBars.length > 1) {
+      const ts = chart.timeScale();
+      for (let i = 1; i < displayBars.length; i++) {
+        const prev = displayBars[i - 1];
+        const cur = displayBars[i];
+        const g = gapBetween(cur, prev);
+        if (Math.abs(g) < 0.001) continue;
+        const x1 = ts.timeToCoordinate(toTimestamp(prev.date) as Time);
+        const x2 = ts.timeToCoordinate(toTimestamp(cur.date) as Time);
+        // 缺口价格带：向上跳空 [prev.high, cur.low]；向下跳空 [cur.high, prev.low]
+        const yA = candle.priceToCoordinate(g > 0 ? cur.low : prev.low);
+        const yB = candle.priceToCoordinate(g > 0 ? prev.high : cur.high);
+        if (x1 == null || x2 == null || yA == null || yB == null) continue;
+        const left = (x1 + 2) * dpr;
+        const w = Math.max(dpr, (x2 - x1 - 4) * dpr);
+        const top = Math.min(yA, yB) * dpr;
+        const h = Math.max(dpr, Math.abs(yB - yA) * dpr);
+        ctx.fillStyle = 'rgba(139, 148, 158, 0.22)';
+        ctx.fillRect(left, top, w, h);
+      }
+    }
+    // 高分屏 DPR 合成后可能超宽，限制最大宽度，控制 base64 体积与多模态 token 成本
+    const MAX_W = 1920;
+    let final: HTMLCanvasElement = out;
+    if (out.width > MAX_W) {
+      const ratio = MAX_W / out.width;
+      final = document.createElement('canvas');
+      final.width = MAX_W;
+      final.height = Math.round(out.height * ratio);
+      const sctx = final.getContext('2d');
+      if (!sctx) return undefined;
+      sctx.drawImage(out, 0, 0, final.width, final.height);
+    }
+
+    // 叠加颜色图例（压缩后图片上 AI 无法凭空知道颜色含义，左上角直接画出来）
+    const sctx2 = final.getContext('2d');
+    if (sctx2) {
+      const fontSize = Math.max(22, Math.round(final.width / 64));
+      const swatch = Math.round(fontSize * 0.7);
+      const gap = Math.round(fontSize * 0.5);
+      const pad = Math.round(fontSize * 0.7);
+      sctx2.font = `bold ${fontSize}px sans-serif`;
+      sctx2.textBaseline = 'alphabetic';
+
+      const drawItem = (x: number, y: number, label: string, color: string): number => {
+        sctx2.fillStyle = color;
+        sctx2.fillRect(x, y - swatch, swatch, swatch);
+        sctx2.fillStyle = '#e6edf3';
+        sctx2.fillText(label, x + swatch + gap * 0.6, y);
+        return x + swatch + gap * 0.6 + sctx2.measureText(label).width + gap * 1.6;
+      };
+
+      const legendBgH = fontSize * 3.4;
+      sctx2.fillStyle = 'rgba(13, 17, 23, 0.82)';
+      sctx2.fillRect(0, 0, final.width, legendBgH);
+
+      let x = pad;
+      let y = pad + fontSize * 0.9;
+      x = drawItem(x, y, '红K线=阳线(涨)', '#f6465d');
+      x = drawItem(x, y, '绿K线=阴线(跌)', '#2ebd85');
+      for (const p of [...maParams].sort((a, b) => a - b)) {
+        x = drawItem(x, y, `MA${p}`, MA_COLORS[p] || '#8b949e');
+      }
+      y += fontSize * 1.5;
+      x = pad;
+      x = drawItem(x, y, '副图量能柱 红=阳线量', '#f6465d');
+      drawItem(x, y, '绿=阴线量', '#2ebd85');
+    }
+    const jpeg = final.toDataURL('image/jpeg', 0.85);
+    // 取证：截图异常小（近乎空白/极稀疏）时打警告——AI 收到的图可能缺内容
+    if (jpeg.length < 30000) {
+      console.warn(
+        `[captureChartImage] 截图疑似异常小（base64 ${jpeg.length}B，正常约 80~200KB）——检查图表渲染/容器尺寸`,
+      );
+    }
+    return jpeg.split(',')[1];
+  }
+
+  // 等待 React 渲染 + 图表重绘完成（轮询 periodRef + 两帧 rAF）
+  function waitPeriodRendered(p: Period): Promise<void> {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const poll = () => {
+        if (periodRef.current === p || Date.now() - t0 > 1500) {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        } else {
+          setTimeout(poll, 30);
+        }
+      };
+      poll();
+    });
+  }
+
+  // 截图模式：日/周/月三周期各截一张图。
+  // 纯视觉切换 period（不动 dayWarmup/dayVisible，推进边界无损），截完切回原周期。
+  // 切换期间图表区加蒙层遮住闪烁：captureChartImage 只合成容器内 canvas 像素，
+  // DOM 蒙层不会进截图；蒙层持续到切回原周期并渲染完成才撤。
+  async function captureMultiPeriodImages(): Promise<string[]> {
+    const SETTLE_MS = 180;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const nextFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+    const original = periodRef.current;
+    const targets: Period[] = ['day', 'week', 'month'];
+    const images: string[] = [];
+    setAiCapturing(true);
+    await nextFrame();
+    await nextFrame(); // 等蒙层渲染出来再开始切换
+    try {
+      for (const p of targets) {
+        if (p !== periodRef.current) {
+          setPeriod(p);
+          await waitPeriodRendered(p);
+          await sleep(SETTLE_MS);
+        }
+        const img = captureChartImage();
+        if (img) images.push(img);
+      }
+    } catch {
+      // 截图失败：已截到的照常用
+    }
+    // 必须切回原周期（step 模式的 advance 推进逻辑依赖当前 period）
+    if (periodRef.current !== original) {
+      setPeriod(original);
+      await waitPeriodRendered(original);
+    }
+    setAiCapturing(false);
+    return images;
+  }
+
+  // image 模式：截取日/周/月三周期图注入 ctx；全部截图失败则回退 csv 模式
+  async function prepareKlineImages(ctx: AiContext): Promise<void> {
+    if (ctx.klineMode !== 'image') return;
+    try {
+      const images = await captureMultiPeriodImages();
+      ctx.klineImages = images;
+      if (images.length === 0) ctx.klineMode = 'csv';
+    } catch {
+      ctx.klineMode = 'csv';
+    }
+  }
+
   // 基于当前已揭示数据构造喂给 LLM 的上下文快照（双盲：K 线隐藏日期只用序号）
   function buildAiContext(): AiContext | null {
     if (!currentBar || displayBars.length === 0) return null;
@@ -1146,17 +1554,8 @@ export default function Training({ config, onFinish, onExit }: Props) {
     const volumeRatio =
       avgVol > 0 && lastDaily ? lastDaily.volume / avgVol : 1;
 
-    // K 线呈现方式：image 模式截取当前图表（失败自动退回 csv）
+    // K 线呈现方式：image 模式的截图由决策函数异步获取（需切周期等渲染），此处只记模式
     const klineMode = loadKlineMode();
-    let klineImage: string | undefined;
-    if (klineMode === 'image' && chartRef.current) {
-      try {
-        const canvas = chartRef.current.takeScreenshot();
-        klineImage = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
-      } catch {
-        klineImage = undefined;
-      }
-    }
 
     return {
       aiPrompt: localStorage.getItem('kline-ai-prompt') || '',
@@ -1168,13 +1567,22 @@ export default function Training({ config, onFinish, onExit }: Props) {
       daily,
       weekly,
       monthly,
+      allDaily: dailyBars,
+      tradeBudgetUsed: tradeBudgetUsedRef.current,
+      tradeBudgetTotal: loadAiTradeBudget(),
       recent20Change,
       recent20Drawdown: maxDD,
       volumeRatio,
+      atr14: dailyBars.length > 14 ? atrPct(dailyBars, dailyBars.length - 1) : null,
+      todayRangePct: lastDaily ? ((lastDaily.high - lastDaily.low) / lastDaily.close) * 100 : null,
+      avgVol20: avgVol,
       logs: [...aiLogsRef.current],
       discipline: { ...disciplineRef.current, closed: [...disciplineRef.current.closed] },
-      klineMode: klineMode === 'image' && klineImage ? 'image' : klineMode,
-      klineImage,
+      klineMode,
+      klineImages: undefined,
+      totalBars: decisionBars,
+      decidedBars: Math.max(1, Math.min(decisionBars, dayVisible - dayWarmup)),
+      limitState: limitStateOf(daySeg, dayVisible - 1, config.code),
     };
   }
 
@@ -1201,6 +1609,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
     try {
       const ctx = buildAiContext();
       if (!ctx) return;
+      await prepareKlineImages(ctx);
       const res = await fetch('/api/ai/decide', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1208,11 +1617,13 @@ export default function Training({ config, onFinish, onExit }: Props) {
           sessionId: sessionIdRef.current,
           system: AI_SYSTEM_PROMPT,
           user: buildAiUserPrompt(ctx),
-          image: ctx.klineImage,
+          images: ctx.klineImages,
+          ...loadAiModels(),
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || `请求失败（${res.status}）`);
+      if (typeof data.model === 'string' && data.model) sessionModelRef.current = data.model;
       // 执行前实时校验（用 ref 而非闭包）：托管已关 / 已结束 / bar 已变则丢弃
       if (!aiAutoRef.current || finishedRef.current) return;
       if (displayBarsRef.current.length !== barAtStart) return;
@@ -1315,6 +1726,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
     try {
       const ctx = buildAiContext();
       if (!ctx) return;
+      await prepareKlineImages(ctx);
       const res = await fetch('/api/ai/decide', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1322,13 +1734,15 @@ export default function Training({ config, onFinish, onExit }: Props) {
           sessionId: sessionIdRef.current,
           mode: 'pred_and_wait',
           kind: 'predict',
-          system: PRED_WAIT_SYSTEM_PROMPT,
+          system: buildPredWaitSystemPrompt(),
           user: buildPredictionUserPrompt(ctx),
-          image: ctx.klineImage,
+          images: ctx.klineImages,
+          ...loadAiModels(),
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || `请求失败（${res.status}）`);
+      if (typeof data.model === 'string' && data.model) sessionModelRef.current = data.model;
       const prediction = normalizePrediction(data);
       if (!prediction) throw new Error('AI 预测输出无法解析');
       if (!aiAutoRef.current || finishedRef.current) return;
@@ -1396,6 +1810,31 @@ export default function Training({ config, onFinish, onExit }: Props) {
     try {
       const ctx = buildAiContext();
       if (!ctx) return;
+      await prepareKlineImages(ctx);
+      // 上轮预测即时对账（此时 predStartDayRef 仍是该轮预测日，须在唤醒响应重置基准日之前构造）
+      const review = buildPredReview(
+        prediction,
+        daySegRef.current,
+        predStartDayRef.current,
+        dayVisibleRef.current - 1,
+        triggerReason,
+      );
+      // 累积战绩：方向对错 + 错误偏向（看多变空 / 看空变多）
+      if (review.actualBias) {
+        const s = predStatsRef.current;
+        s.total += 1;
+        if (review.correct) {
+          s.hit += 1;
+        } else if (prediction.bias === 'up') {
+          s.bullishMiss += 1;
+        } else if (prediction.bias === 'down') {
+          s.bearishMiss += 1;
+        }
+      }
+      // 对账 + 战绩拼接注入（战绩含策略适配性警示）
+      const predReview = [review.text, renderPredStats(predStatsRef.current)]
+        .filter(Boolean)
+        .join('\n');
       const res = await fetch('/api/ai/decide', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1403,13 +1842,15 @@ export default function Training({ config, onFinish, onExit }: Props) {
           sessionId: sessionIdRef.current,
           mode: 'pred_and_wait',
           kind: 'wake',
-          system: PRED_WAIT_SYSTEM_PROMPT,
-          user: buildWakeUserPrompt(prediction, triggerReason, ctx, horizonRepeatHint()),
-          image: ctx.klineImage,
+          system: buildPredWaitSystemPrompt(),
+          user: buildWakeUserPrompt(prediction, triggerReason, ctx, horizonRepeatHint(), predReview),
+          images: ctx.klineImages,
+          ...loadAiModels(),
         }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || `请求失败（${res.status}）`);
+      if (typeof data.model === 'string' && data.model) sessionModelRef.current = data.model;
       if (!aiAutoRef.current || finishedRef.current) return;
       if (dayVisibleRef.current !== barAtStart) return;
 
@@ -1539,6 +1980,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
     }
     return {
       id: String(Date.now()),
+      sessionId: sessionIdRef.current,
       code: config.code,
       stockName: codeToStockName(config.code),
       period,
@@ -1558,6 +2000,25 @@ export default function Training({ config, onFinish, onExit }: Props) {
       heavySeries: [...heavySeriesRef.current],
       durationMs: Date.now() - sessionStartRef.current,
       mode,
+      // 训练环境快照：归因分析（prompt 版本 / 模型 / 规则版本 / AI 模式 / 预测战绩）
+      meta: {
+        aiPrompt: localStorage.getItem('kline-ai-prompt') || '',
+        riskGuide: loadAiRiskGuide(),
+        klineMode: loadKlineMode(),
+        positions: config.positions,
+        maParams: [...config.maParams].sort((a, b) => a - b),
+        decisionBars: config.decisionBars,
+        feeRate: config.feeRate,
+        slippage: config.slippage,
+        stampTax: config.stampTax,
+        aiMode: aiModeRef.current,
+        llmModel: sessionModelRef.current,
+        ruleVersion: RULE_VERSION,
+        predStats:
+          aiModeRef.current === 'pred_wait'
+            ? { ...predStatsRef.current }
+            : undefined,
+      },
       createdAt: Date.now(),
     };
   }
@@ -1566,6 +2027,15 @@ export default function Training({ config, onFinish, onExit }: Props) {
     if (decisionBars <= 0) return 0;
     return Math.min(1, (dayVisible - dayWarmup) / decisionBars);
   }, [dayVisible, dayWarmup, decisionBars]);
+
+  // 复盘模式：交易与推进操作全部锁定（只读回看，不产生新决策/新交易）
+  const replayLocked = !!replayRecord;
+
+  // 当日涨跌停状态（涨停禁买 / 跌停禁卖；随最新揭示日线变化）
+  const limitLocked = useMemo(
+    () => limitStateOf(daySeg, dayVisible - 1, config.code),
+    [daySeg, dayVisible, config.code],
+  );
 
   const floatPnl = shares > 0 ? (currentPrice - avgCost) * shares : 0;
   const floatPnlRate = shares > 0 && avgCost > 0 ? (currentPrice - avgCost) / avgCost : 0;
@@ -1694,7 +2164,27 @@ export default function Training({ config, onFinish, onExit }: Props) {
         </div>
       </div>
 
+      {replayRecord && (
+        <div className="replay-banner">
+          <b>📍 复盘模式</b>
+          历史训练结果还原（{replayRecord.code} · {replayRecord.startDate.slice(0, 10)} ~{' '}
+          {replayRecord.endDate.slice(0, 10)}），图上箭头为该场全部买卖点
+        </div>
+      )}
+
       <div className="chart-area" ref={containerRef}>
+        {/* 复盘模式：训练起终点全高虚线（位置由 updateReplayLines 动态设置） */}
+        <div ref={replayStartLineRef} className="replay-range-line" style={{ display: 'none' }}>
+          <span className="replay-range-tag">训练起点</span>
+        </div>
+        <div ref={replayEndLineRef} className="replay-range-line end" style={{ display: 'none' }}>
+          <span className="replay-range-tag">训练终点</span>
+        </div>
+        {aiCapturing && (
+          <div className="chart-capture-mask">
+            <span>AI 正在读取图表（日 / 周 / 月）…</span>
+          </div>
+        )}
         {loading && (
           <div className="overlay-hint">加载行情数据中…</div>
         )}
@@ -1730,7 +2220,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
                   <button
                     key={n}
                     className={`seg-btn ${buyLots === n ? 'active' : ''}`}
-                    disabled={aiAuto}
+                    disabled={aiAuto || replayLocked}
                     onClick={() => setBuyLots(n)}
                   >
                     {n}
@@ -1739,14 +2229,15 @@ export default function Training({ config, onFinish, onExit }: Props) {
               </div>
               <button
                 className="action-btn buy"
-                disabled={lots >= config.positions || aiAuto || loading || !!loadError}
+                disabled={replayLocked || lots >= config.positions || aiAuto || loading || !!loadError || limitLocked === 'up'}
+                title={limitLocked === 'up' ? '今日收盘涨停（封板），无法买入' : undefined}
                 onClick={() => doAction('buy')}
               >
                 买入·{buyLots}
               </button>
               <button
                 className="action-btn hold"
-                disabled={aiAuto || loading || !!loadError}
+                disabled={replayLocked || aiAuto || loading || !!loadError}
                 onClick={() => doAction('hold')}
               >
                 观望
@@ -1758,7 +2249,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
                   <button
                     key={n}
                     className={`seg-btn ${sellLots === n ? 'active' : ''}`}
-                    disabled={aiAuto}
+                    disabled={aiAuto || replayLocked}
                     onClick={() => setSellLots(n)}
                   >
                     {n}
@@ -1767,39 +2258,21 @@ export default function Training({ config, onFinish, onExit }: Props) {
               </div>
               <button
                 className="action-btn sell"
-                disabled={lots <= 0 || aiAuto || loading || !!loadError}
+                disabled={replayLocked || lots <= 0 || aiAuto || loading || !!loadError || limitLocked === 'down'}
+                title={limitLocked === 'down' ? '今日收盘跌停（封死），无法卖出' : undefined}
                 onClick={() => doAction('sell')}
               >
                 卖出·{sellLots}
               </button>
             </div>
             <div className="tb-sep" />
-            {/* ---- AI 决策区：模式 + 托管 ---- */}
+            {/* ---- AI 决策区：托管开关（模式在训练设置页配置） ---- */}
             <div className="tb-group ai-zone">
               <span className="tb-chip ai zone-chip">AI 托管</span>
-              <div className="seg">
-                {(
-                  [
-                    ['step', '逐根'],
-                    ['pred_wait', '预测'],
-                  ] as const
-                ).map(([m, label]) => (
-                  <button
-                    key={m}
-                    className={`seg-btn ${aiMode === m ? 'active' : ''}`}
-                    disabled={aiAuto || loading || !!loadError}
-                    onClick={() => {
-                      setAiMode(m);
-                      aiModeRef.current = m;
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+              <span className="tb-label">{aiMode === 'pred_wait' ? '预测等待' : '逐根'}</span>
               <button
                 className={`seg-btn ${aiAuto ? 'active' : 'cta'}`}
-                disabled={loading || !!loadError}
+                disabled={replayLocked || loading || !!loadError}
                 onClick={() => {
                   const next = !aiAuto;
                   setAiAuto(next);
@@ -1862,7 +2335,7 @@ export default function Training({ config, onFinish, onExit }: Props) {
               )}
             </div>
             <div style={{ flex: 1 }} />
-            <button className="ghost-btn danger" onClick={endTraining}>
+            <button className="ghost-btn danger" disabled={replayLocked} onClick={endTraining}>
               结束训练
             </button>
           </>
@@ -1943,7 +2416,12 @@ export default function Training({ config, onFinish, onExit }: Props) {
           </div>
           <div className="stat-chip">
             <span className="k">现价</span>
-            <span className="v">{currentPrice ? currentPrice.toFixed(3) : '—'}</span>
+            <span
+              className={`v ${limitLocked === 'up' ? 'up' : limitLocked === 'down' ? 'down' : ''}`}
+            >
+              {currentPrice ? currentPrice.toFixed(3) : '—'}
+              {limitLocked === 'up' ? ' ⛔涨停' : limitLocked === 'down' ? ' ⛔跌停' : ''}
+            </span>
           </div>
           <div className="stat-chip">
             <span className="k">浮动盈亏</span>

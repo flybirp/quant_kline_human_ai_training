@@ -152,9 +152,14 @@ button {
   transition: all 0.15s;
 }
 
-.seg-btn:hover {
+.seg-btn:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--text);
+}
+
+.seg-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .seg-btn.active {
@@ -170,7 +175,7 @@ button {
   font-weight: 600;
 }
 
-.seg-btn.cta:hover {
+.seg-btn.cta:hover:not(:disabled) {
   background: var(--accent);
   color: #fff;
 }
@@ -369,6 +374,92 @@ button {
   position: relative;
 }
 
+/* 复盘模式 banner：训练页加在顶部，提示这是历史记录的还原 */
+.replay-banner {
+  background: rgba(227, 179, 65, 0.12);
+  border: 1px solid rgba(227, 179, 65, 0.4);
+  color: var(--gold);
+  padding: 14px 20px;
+  border-radius: 8px;
+  font-size: 16px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.replay-banner b {
+  font-size: 19px;
+  margin-right: 10px;
+}
+
+/* 复盘模式：训练起终点全高竖直虚线（left 由 JS 动态设置） */
+.replay-range-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px dashed rgba(227, 179, 65, 0.6);
+  z-index: 5;
+  pointer-events: none;
+}
+
+.replay-range-line.end {
+  border-left-color: rgba(63, 137, 247, 0.6);
+}
+
+.replay-range-tag {
+  position: absolute;
+  top: 6px;
+  left: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(227, 179, 65, 0.85);
+  color: #1b1f24;
+  font-weight: 600;
+}
+
+.replay-range-line.end .replay-range-tag {
+  background: rgba(63, 137, 247, 0.85);
+  color: #fff;
+}
+.record-item-card.clickable {
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.record-item-card.clickable:hover {
+  border-color: var(--gold);
+  transform: translateY(-1px);
+}
+
+/* AI 托管 image 模式：多周期截图期间的蒙层，遮住周期切换的图表重绘闪烁。
+   背景色与图表底色(#0d1117)一致、接近不透明；截图只合成 canvas 像素，蒙层不会进图。 */
+.chart-capture-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(13, 17, 23, 0.96);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--gold);
+  font-size: 14px;
+  letter-spacing: 1px;
+  pointer-events: none;
+  z-index: 9;
+  animation: chartMaskIn 0.15s ease;
+}
+
+@keyframes chartMaskIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .overlay-hint {
   position: absolute;
   top: 12px;
@@ -535,7 +626,7 @@ button {
   background: var(--up);
 }
 
-.action-btn.buy:hover {
+.action-btn.buy:hover:not(:disabled) {
   filter: brightness(1.1);
 }
 
@@ -543,7 +634,7 @@ button {
   background: var(--down);
 }
 
-.action-btn.sell:hover {
+.action-btn.sell:hover:not(:disabled) {
   filter: brightness(1.1);
 }
 
@@ -555,7 +646,7 @@ button {
   font-weight: 600;
 }
 
-.action-btn.hold:hover {
+.action-btn.hold:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--text-faint);
 }
@@ -576,9 +667,14 @@ button {
   transition: all 0.15s;
 }
 
-.ghost-btn:hover {
+.ghost-btn:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--text-faint);
+}
+
+.ghost-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 /* 危险操作（结束训练）：红描边 */
@@ -587,7 +683,7 @@ button {
   border-color: rgba(246, 70, 93, 0.4);
 }
 
-.ghost-btn.danger:hover {
+.ghost-btn.danger:hover:not(:disabled) {
   color: var(--up);
   border-color: var(--up);
 }
