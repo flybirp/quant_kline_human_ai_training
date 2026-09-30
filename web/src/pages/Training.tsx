@@ -15,7 +15,7 @@ import type {
   Time,
   UTCTimestamp,
 } from 'lightweight-charts';
-import { fetchKline } from '../api';
+import { fetchKline, fetchRps } from '../api';
 import type { Bar, Period, Trade, TrainingConfig, TrainingRecord } from '../types';
 import { codeToStockName } from '../lib/stock';
 import {
@@ -35,6 +35,8 @@ import type { Discipline, Prediction, PredStats, PredWakeEvent } from '../lib/pr
 import { gapBetween, klineAsciiBlock, loadKlineMode, type KlineMode } from '../lib/klineArt';
 import { loadAiMode, loadAiModels, loadAiRiskGuide, loadAiTradeBudget, renderRiskGuide } from '../lib/aiSettings';
 import { atrPct, patternSummaryBlock } from '../lib/patterns';
+import { exitGuideBlock } from '../lib/exitGuide';
+import { weeklyStateBlock } from '../lib/weeklyState';
 import { limitStateOf, RULE_VERSION, WARMUP_MIN_BARS } from '../lib/limit';
 import AiLogPanel from '../components/AiLogPanel';
 import { makeId } from '../lib/aiMessages';
@@ -191,6 +193,7 @@ interface AiContext {
   volumeRatio: number; // 最新日线量 / 前20根日均量
   atr14: number | null; // ATR14 日均真实波幅（占价格%）：波动正常性基准
   todayRangePct: number | null; // 最新日线振幅（%）
+  rps: number | null; // 相对强度分位 0~99（高=强）；横盘形态下有效，null=无数据
   avgVol20: number; // 20日均量（绝对值）：流动性/冷门程度基准（量比只是相对值）
   logs: string[]; // s3：近期决策记忆（含理由）
   discipline: Discipline; // 交易纪律短期记忆（本场行为统计与犯错记录）
@@ -407,6 +410,22 @@ function buildAiUserPrompt(ctx: AiContext): string {
     lines.push('');
   }
 
+  // 周线状态（「周线定方向 + 日线找入场点」的状态层：定的是恐慌/趋势/横盘状态，不是朴素多空）
+  const wsBlock = weeklyStateBlock(ctx.allDaily);
+  if (wsBlock) {
+    lines.push(...wsBlock);
+    lines.push('');
+  }
+
+  // 持有与卖出指引（quant_discover d24~d29；仅持仓时注入——空仓不需要卖出指引，且省 token）
+  if (ctx.positions > 0) {
+    const exitBlock = exitGuideBlock({ floatPnlRate: ctx.floatPnlRate });
+    if (exitBlock) {
+      lines.push(...exitBlock);
+      lines.push('');
+    }
+  }
+
   lines.push('请基于以上多周期走势给出本根K线收盘后的决策，只输出 JSON。');
   return lines.join('\n');
 }
@@ -567,6 +586,8 @@ export default function Training({ config, onFinish, onExit, replayRecord }: Pro
   const cashRef = useRef(config.initialCapital);
   const sharesRef = useRef(0);
   const avgCostRef = useRef(0);
+  // RPS 相对强度分位序列（date -> 0~99），由 loadSegment 异步填充；空则上下文不注入
+  const rpsRef = useRef<Map<string, number>>(new Map());
   const lotsRef = useRef(0);
 
   // 每根决策 bar 的「持仓状态(0/1)」「是否重仓(0/1)」序列，供统计页使用
@@ -603,6 +624,10 @@ export default function Training({ config, onFinish, onExit, replayRecord }: Pro
       setLoadError('');
       try {
         const dayFull = await fetchKline(code, 'day');
+        // RPS 相对强度分位序列（异步填充，失败降级为空 Map → 上下文不注入该行）
+        fetchRps(code).then((m) => {
+          rpsRef.current = m;
+        });
         const totalMin = WARMUP_MIN_BARS + decisionBars;
         if (dayFull.length < totalMin) {
           throw new Error(
@@ -1575,6 +1600,7 @@ export default function Training({ config, onFinish, onExit, replayRecord }: Pro
       volumeRatio,
       atr14: dailyBars.length > 14 ? atrPct(dailyBars, dailyBars.length - 1) : null,
       todayRangePct: lastDaily ? ((lastDaily.high - lastDaily.low) / lastDaily.close) * 100 : null,
+      rps: lastDaily ? (rpsRef.current.get(lastDaily.date) ?? null) : null,
       avgVol20: avgVol,
       logs: [...aiLogsRef.current],
       discipline: { ...disciplineRef.current, closed: [...disciplineRef.current.closed] },
@@ -1680,11 +1706,21 @@ export default function Training({ config, onFinish, onExit, replayRecord }: Pro
     if (!bar) return;
 
     const timeReached = idx >= predStartDayRef.current + predictionRef.current.horizon;
+    // trail（移动止盈）判定需要的持仓状态：成本价 + 持仓期间最高价
+    // （统计上 trail 是唯一有效的主动退出方式，见 quant_discover d25）
+    let posState: { avgCost: number; peak: number } | undefined;
+    if (avgCostRef.current > 0) {
+      let peak = -Infinity;
+      const from = Math.max(0, predStartDayRef.current);
+      for (let i = from; i <= idx; i++) peak = Math.max(peak, arr[i].high);
+      if (Number.isFinite(peak)) posState = { avgCost: avgCostRef.current, peak };
+    }
     const hits = checkTriggers(
       predictionRef.current,
       bar,
       { baseAvgVolume: baseAvgVolRef.current },
       timeReached,
+      posState,
     );
 
     if (hits.length > 0) {

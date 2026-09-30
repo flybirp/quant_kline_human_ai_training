@@ -2,6 +2,8 @@ import type { Bar } from '../types';
 import { klineAsciiBlock } from './klineArt';
 import { loadAiHorizon, loadAiRiskGuide, renderRiskGuide } from './aiSettings';
 import { patternSummaryBlock } from './patterns';
+import { exitGuideBlock } from './exitGuide';
+import { weeklyStateBlock } from './weeklyState';
 
 // 预测有效期范围（交易日）：设置页可配（loadAiHorizon 持久化），min 是治理频繁交易的旋钮
 export function horizonRange(): { min: number; max: number } {
@@ -12,7 +14,12 @@ export type TriggerKind =
   | 'break_up'
   | 'break_down'
   | 'volume_ratio_gt'
-  | 'volume_ratio_lt';
+  | 'volume_ratio_lt'
+  // 移动止盈（trail）：浮盈达 value% 后，自持仓期间最高价回落 value2% 时命中。
+  // 依据 quant_discover d25：trail 是唯一有效的主动退出方式（金叉 trail(10/5) E 5.41/胜率 78%
+  // vs 死叉 2.41/37%；腰斩 trail(30/10) E净 16.76 > 持有 15.14），且时间止损/均线破位/跌破支撑
+  // 等做法均已被证伪。故 value=激活浮盈%、value2=回落%。
+  | 'trail';
 
 export type Bias = 'up' | 'down' | 'sideways';
 
@@ -20,6 +27,8 @@ export interface PredTrigger {
   id: string;
   kind: TriggerKind;
   value: number;
+  // trail 专用：自持仓最高价的回落百分比（value 为激活浮盈百分比）
+  value2?: number;
   desc?: string;
 }
 
@@ -134,6 +143,7 @@ export interface PredContext {
   klineMode?: 'csv' | 'chart' | 'image'; // K 线呈现方式（缺省 csv）
   klineImages?: string[]; // image 模式：日/周/月三周期截图 base64
   limitState?: 'up' | 'down' | null; // 当日涨跌停状态（涨停禁买 / 跌停禁卖）
+  rps?: number | null; // 相对强度分位 0~99（高=强）；横盘场景有效，见 buildContextBody
   totalBars?: number; // 本场决策总根数
   decidedBars?: number; // 当前已进行到的决策根序号（1-based）
 }
@@ -222,13 +232,14 @@ export function buildPredWaitSystemPrompt(): string {
 - break_down：价格下破目标价（当某根日线 low <= value 时命中）
 - volume_ratio_gt：放量（最新日线量 / 预测日前20日均量 >= value 时命中）
 - volume_ratio_lt：缩量（最新日线量 / 预测日前20日均量 <= value 时命中）
+- trail：移动止盈，需同时给 value 与 value2——浮盈达 value% 之后，自持仓期间最高价回落 value2% 时命中（仅在持仓时判定）。例 value=30/value2=10 即 trail(30/10)：浮盈 30% 后回撤 10% 卖出。统计参考档位：腰斩类 (30/10)、底背离 (20/8)、spring (20/10)、绝望组 (20/8)。
 触发条件应设在有意义的结构位（前高/前低/关键均线/整数关口/量能阈值），且距当前价格至少3%以上——贴价触发器会被日常噪音击穿，导致频繁唤醒与频繁交易（成本磨损的主要来源）；触发后若非高置信信号应选择观望而非急于交易。
 量比触发器的阈值建议≥2.5（1.5是日常常见值，会频繁命中）；触发器只设在"值得改变决策"的位置——真正的观望是挂好远处的触发器然后让市场自己走，中间的小波动不值得被唤醒；到期内未命中就让它自然到期。
 
 输出必须是严格 JSON，不要任何其他文字。
 
 「预测」时刻输出格式：
-{"horizon":整数(${h.min}~${h.max}个交易日),"initial_action":"buy|hold","initial_lots":整数(initial_action=buy时必填),"bias":"up|down|sideways","expected_range":{"low":数字,"high":数字},"triggers":[{"id":"t1","kind":"break_up|break_down|volume_ratio_gt|volume_ratio_lt","value":数字,"desc":"触发说明"}],"summary":"50字以内的预测概述"}
+{"horizon":整数(${h.min}~${h.max}个交易日),"initial_action":"buy|hold","initial_lots":整数(initial_action=buy时必填),"bias":"up|down|sideways","expected_range":{"low":数字,"high":数字},"triggers":[{"id":"t1","kind":"break_up|break_down|volume_ratio_gt|volume_ratio_lt|trail","value":数字,"value2":数字(仅trail需要，回落%),"desc":"触发说明"}],"summary":"50字以内的预测概述"}
 
 「唤醒」时刻输出格式：
 {"action":"buy|sell|hold","lots":整数,"reason":"50字以内的决策理由","revised":{可选，同预测格式，不填则沿用原预测}}`;
@@ -364,6 +375,19 @@ function buildContextBody(ctx: PredContext): string[] {
         : '';
     lines.push(`日均真实波幅 ATR14 = ${ctx.atr14.toFixed(2)}%——这是该股的正常波动基准${atrNote}`);
   }
+  // 相对强度 RPS（d15）：仅在横盘形态下有效，超跌类形态无增强作用
+  if (ctx.rps != null) {
+    const rpsNote =
+      ctx.rps >= 80
+        ? '当前属强势组（横盘场景优选：强势中继）'
+        : ctx.rps < 20
+          ? '当前属弱势组（横盘场景应回避：弱势停顿）'
+          : '当前属中间组';
+    lines.push(
+      `相对强度 RPS 分位 ${ctx.rps}（0~99，高=强：个股 120 日收益相对中证1000 的超额在全市场的排名百分位）——${rpsNote}；` +
+        '⚠️ 该指标**只在横盘（区间震荡）形态下有效**：横盘结束日 RPS≥80 显著优于 RPS<20（胜率差约 11pct，分组单调且分年 10/10 稳定）；对超跌类形态（筑底跌破/金叉/腰斩）无增强作用，勿跨形态复用',
+    );
+  }
   lines.push('');
 
   // 形态特征（quant_discover 统计先验的程序判定，全量已揭示日线，仅因果数据）
@@ -371,6 +395,22 @@ function buildContextBody(ctx: PredContext): string[] {
   if (patternBlock) {
     lines.push(...patternBlock);
     lines.push('');
+  }
+
+  // 周线状态（「周线定方向 + 日线找入场点」的状态层：定的是恐慌/趋势/横盘状态，不是朴素多空）
+  const wsBlock = weeklyStateBlock(ctx.allDaily);
+  if (wsBlock) {
+    lines.push(...wsBlock);
+    lines.push('');
+  }
+
+  // 持有与卖出指引（quant_discover d24~d29；仅持仓时注入——空仓不需要卖出指引，且省 token）
+  if (ctx.positions > 0) {
+    const exitBlock = exitGuideBlock({ floatPnlRate: ctx.floatPnlRate });
+    if (exitBlock) {
+      lines.push(...exitBlock);
+      lines.push('');
+    }
   }
 
   return lines;
@@ -520,6 +560,7 @@ const TRIGGER_KINDS: TriggerKind[] = [
   'break_down',
   'volume_ratio_gt',
   'volume_ratio_lt',
+  'trail',
 ];
 
 function normalizeTriggers(raw: unknown): PredTrigger[] {
@@ -532,12 +573,18 @@ function normalizeTriggers(raw: unknown): PredTrigger[] {
     if (!TRIGGER_KINDS.includes(kind)) continue;
     const value = Number(o.value);
     if (!Number.isFinite(value)) continue;
-    out.push({
+    const trig: PredTrigger = {
       id: String(o.id || `t${out.length + 1}`),
       kind,
       value,
       desc: typeof o.desc === 'string' ? o.desc : undefined,
-    });
+    };
+    // trail 的第二参数（回落%）：缺失时按激活浮盈的一半兜底，避免触发器永久失效
+    if (kind === 'trail') {
+      const v2 = Number(o.value2);
+      trig.value2 = Number.isFinite(v2) && v2 > 0 ? v2 : Math.max(1, value / 2);
+    }
+    out.push(trig);
   }
   return out;
 }
@@ -580,11 +627,18 @@ export interface PredBarStats {
   baseAvgVolume: number; // 预测日之前的近 20 日均量
 }
 
+// trail（移动止盈）判定所需的持仓状态；空仓或未知时传 undefined，trail 不参与判定
+export interface PredPosState {
+  avgCost: number; // 持仓成本价
+  peak: number; // 持仓期间最高价
+}
+
 export function checkTriggers(
   prediction: Prediction,
   bar: Bar,
   stats: PredBarStats,
   timeReached: boolean,
+  pos?: PredPosState,
 ): TriggerHit[] {
   const hits: TriggerHit[] = [];
   for (const t of prediction.triggers) {
@@ -599,6 +653,17 @@ export function checkTriggers(
     } else if (t.kind === 'volume_ratio_lt' && stats.baseAvgVolume > 0) {
       if (bar.volume / stats.baseAvgVolume <= t.value) {
         hits.push({ trigger: t, reason: `${t.desc || '缩量'}（量比 ${(bar.volume / stats.baseAvgVolume).toFixed(2)}）` });
+      }
+    } else if (t.kind === 'trail' && pos && pos.avgCost > 0 && pos.peak > 0) {
+      // 移动止盈：浮盈达 value% 后，自持仓最高价回落 value2%（收盘价口径，与成交口径一致）
+      const gain = (bar.close - pos.avgCost) / pos.avgCost;
+      const dd = (pos.peak - bar.close) / pos.peak;
+      const d = t.value2 ?? t.value / 2;
+      if (gain >= t.value / 100 && dd >= d / 100) {
+        hits.push({
+          trigger: t,
+          reason: `${t.desc || '移动止盈'}（浮盈 ${(gain * 100).toFixed(1)}% ≥ ${t.value}%，自最高 ${pos.peak.toFixed(2)} 回落 ${(dd * 100).toFixed(1)}% ≥ ${d}%）`,
+        });
       }
     }
   }
@@ -659,10 +724,15 @@ export function buildOutcome(
   const prev = daySeg.slice(Math.max(0, predStartDay - 20), predStartDay);
   const baseAvgVolume = prev.length > 0 ? prev.reduce((s, b) => s + b.volume, 0) / prev.length : 0;
 
+  // 建仓成本（预测日收盘，pred_wait 模式下 initial_action=buy 即以此价成交）
+  const entryCost = daySeg[predStartDay]?.close ?? 0;
+
   const triggerResults: PredTriggerResult[] = prediction.triggers.map((t) => {
     const result: PredTriggerResult = { id: t.id, kind: t.kind, value: t.value, hit: false };
+    let peakSince = -Infinity; // 持仓期间最高价（trail 判定用）
     for (let i = 0; i < futureBars.length; i++) {
       const b = futureBars[i];
+      peakSince = Math.max(peakSince, b.high);
       let hit = false;
       let hitPrice: number | undefined;
       if (t.kind === 'break_up' && b.high >= t.value) {
@@ -677,6 +747,14 @@ export function buildOutcome(
       } else if (t.kind === 'volume_ratio_lt' && baseAvgVolume > 0 && b.volume / baseAvgVolume <= t.value) {
         hit = true;
         hitPrice = b.close;
+      } else if (t.kind === 'trail' && entryCost > 0 && peakSince > 0) {
+        const gain = (b.close - entryCost) / entryCost;
+        const dd = (peakSince - b.close) / peakSince;
+        const d = t.value2 ?? t.value / 2;
+        if (gain >= t.value / 100 && dd >= d / 100) {
+          hit = true;
+          hitPrice = b.close;
+        }
       }
       if (hit) {
         result.hit = true;

@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
+import { verify, verifyPair, loadUnifiedTrade } from './lib/verifier.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const DATA_DIR =
@@ -416,6 +417,105 @@ app.post('/api/ai/decide', async (req, res) => {
     res.status(504).json({ error: msg });
   } finally {
     clearTimeout(timer);
+  }
+});
+
+// ---- RPS 相对强度分位（quant_discover d15 口径）----
+// rel_ret_120d = 个股 120 日收益 − 中证1000 同期收益；RPS = 当日全市场截面百分位（0~99，高=强）
+// 数据由 baozhu_analysis/build_rps.py 预计算（server/data/rps/{code}.csv）
+// ⚠️ 唯一稳定用法是**横盘**场景（分组单调递增、分年 10/10）：RPS≥80 强势中继、RPS<20 弱势停顿；
+//    对超跌类形态无增强作用，勿跨形态复用。
+const RPS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'rps');
+const RPS_DIR_OK = fs.existsSync(RPS_DIR);
+const rpsCache = new Map(); // code -> Map(date -> 分位)
+
+function loadRpsSeries(code) {
+  if (rpsCache.has(code)) return rpsCache.get(code);
+  const m = new Map();
+  const f = path.join(RPS_DIR, `${code}.csv`);
+  if (RPS_DIR_OK && fs.existsSync(f)) {
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const p = line.split(',');
+      if (p.length >= 2 && p[0]) m.set(p[0], Number(p[1]));
+    }
+  }
+  rpsCache.set(code, m);
+  return m;
+}
+
+app.get('/api/rps', (req, res) => {
+  const code = String(req.query.code || '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    res.status(400).json({ error: '参数缺失或非法：code 需为 6 位数字' });
+    return;
+  }
+  const series = loadRpsSeries(code);
+  const date = String(req.query.date || '').trim();
+  if (date) {
+    // 精确命中；无该日（停牌/非交易日）时取之前最近一个交易日
+    let rps = series.get(date);
+    let used = date;
+    if (rps === undefined) {
+      const earlier = [...series.keys()].filter((d) => d <= date).sort();
+      if (earlier.length) {
+        used = earlier[earlier.length - 1];
+        rps = series.get(used);
+      }
+    }
+    res.json({ code, date: used, rps: rps ?? null });
+    return;
+  }
+  res.json({ code, series: [...series.entries()] });
+});
+
+// ---- LLM-as-a-Verifier（L0.2）：绝对分 verify / 成对 verifyPair ----
+// body（absolute，默认）: { tradeId | trade | subject, criteria?, repeats?, model?, useCache? }
+// body（pair）: { mode: 'pair', subjectA, subjectB, criterion?, model? }
+app.post('/api/ai/verify', async (req, res) => {
+  const b = req.body || {};
+  try {
+    if (b.mode === 'pair') {
+      const result = await verifyPair({
+        subjectA: b.subjectA,
+        subjectB: b.subjectB,
+        criterion: b.criterion,
+        model: b.model,
+      });
+      res.json(result);
+      return;
+    }
+    let trade = null;
+    let subject = null;
+    let tradeId = null;
+    if (typeof b.tradeId === 'string' && b.tradeId) {
+      trade = loadUnifiedTrade(b.tradeId);
+      if (!trade) {
+        res.status(404).json({ error: `trades-unified.jsonl 中不存在 tradeId: ${b.tradeId}` });
+        return;
+      }
+      tradeId = b.tradeId;
+    } else if (b.trade && typeof b.trade === 'object') {
+      trade = b.trade;
+      tradeId = b.trade.id || null;
+    } else if (typeof b.subject === 'string' && b.subject) {
+      subject = b.subject;
+    } else {
+      res.status(400).json({ error: '参数缺失：需要 tradeId / trade / subject 之一' });
+      return;
+    }
+    const result = await verify({
+      trade,
+      subject,
+      tradeId,
+      criteria: b.criteria,
+      repeats: b.repeats,
+      model: b.model,
+      useCache: b.useCache !== false,
+    });
+    res.json(result);
+  } catch (e) {
+    const status = /LLM 未配置/.test(e.message) ? 503 : 500;
+    res.status(status).json({ error: e.message });
   }
 });
 

@@ -79,6 +79,8 @@ export function triggerKindLabel(kind: PredTrigger['kind']): string {
       return '放量';
     case 'volume_ratio_lt':
       return '缩量';
+    case 'trail':
+      return '移动止盈';
     default:
       return kind;
   }

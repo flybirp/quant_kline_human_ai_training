@@ -44,8 +44,8 @@ function fmtPct(v: number): string {
   return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`;
 }
 
-// ISO 自然周分桶键（周一为始），用于 base_break 的周线口径
-function isoWeekKey(dateStr: string): string {
+// ISO 自然周分桶键（周一为始），用于 base_break 的周线口径；weeklyState 复用同一口径
+export function isoWeekKey(dateStr: string): string {
   const d = new Date(`${dateStr}T00:00:00Z`);
   const day = d.getUTCDay() || 7;
   d.setUTCDate(d.getUTCDate() + 4 - day); // 本周四 → 所属 ISO 周
@@ -86,8 +86,8 @@ function detectDivergenceBottom(bars: Bar[]): PatternHit | null {
         barsAgo: n - 1 - l2,
         detail: `第二低点较前低创新低、量能仅为前低的${volShrink.toFixed(2)}倍，两点间隔${l2 - l1}根，中间反弹${fmtPct(rebound)}${full ? '（完整结构）' : ''}`,
         prior: full
-          ? '历史净增+5pct、完整结构20日E+11.2%/胜率65%（全项目第二强买点，60日期望+7.8%）'
-          : '历史净增+5pct、60日期望+7.8%、分年11/13为正（一路阴跌中的背离质量减半）',
+          ? '历史净增+5pct、完整结构20日E+11.2%/胜率65%（全项目第二强买点，60日期望+7.8%；⚠ 报告值为上界，真实值约低16~32%）'
+          : '历史净增+5pct、60日期望+7.8%、分年11/13为正（✅ 全项目唯一通过年度方向稳定性检验的信号 p=0.023，可直接使用；一路阴跌中的背离质量减半）',
       };
     }
   }
@@ -148,7 +148,7 @@ function detectFractalBottom(bars: Bar[]): PatternHit | null {
       barsAgo: n - 1 - confirmIdx,
       detail: `三K分型深度${depth.toFixed(1)}%${atrNote}，前20根跌幅${drop20}%`,
       prior:
-        (deep ? '深分型档：20日胜率66.8%/E+7.8%；' : '中档分型：20日胜率62%左右；') +
+        (deep ? '深分型档：20日胜率66.8%/E+7.8%（⚠ 上界；须有前20日深跌≥30%前置才可信，5-20日短持有）；' : '中档分型：20日胜率62%左右（⚠ 上界）；') +
         (drop20 >= 30
           ? '深跌背景（≥30%）下信号可信度显著更高（最强组合84%）'
           : '跌幅10~20%背景信号质量中等，可轻仓试探'),
@@ -185,7 +185,7 @@ function detectEffortDefeat(bars: Bar[]): PatternHit | null {
         barsAgo: n - 1 - k,
         detail: `${j + 1 === k ? '次日' : `${k - j}根后`}阳线收复量比${vj.toFixed(1)}大阴线高点${effortStr}`,
         prior: good
-          ? '努力比<0.6：5日胜率65%+；空头发力被轻松击败，短期反攻信号可靠'
+          ? '努力比<0.6：5日胜率65%+（⚠ 短窗口，扣费与偏差后边际收窄）；空头发力被轻松击败，短期反攻信号可靠'
           : '缩量反击成立但击败量偏大（努力比≥0.6），信号强度一般（5日胜率56%左右）',
       };
     }
@@ -234,11 +234,22 @@ function detectSpring(bars: Bar[]): PatternHit | null {
       barsAgo: n - 1 - r,
       detail: `横盘支撑${support.toFixed(2)}被收盘跌破${depth >= 1 ? depth.toFixed(1) : '≥1'}%后${r - breakIdx}根内收回，跌破深度${depth.toFixed(1)}%${atrNote}`,
       prior: deep
-        ? '深spring（绝对≥5%或≥2.5倍日均波幅）：20日胜率60.8%/E+4.2%；止损设在spring最低价，勿设在支撑位'
-        : 'spring净增+5pct；浅spring（<2%且不足1.5倍日均波幅）质量一般（50%），深度越深越可靠',
+        ? '深spring（绝对≥5%或≥2.5倍日均波幅）：20日胜率60.8%/E+4.2%（⚠ 上界；年度摇摆剧烈 2014年99%→2017年29%）；持有期U型——20日可用、60日难受、180日+14.76%；禁止「跌破支撑就卖」（E 从 8.91 砍到 4.83，-46%）'
+        : 'spring净增+5pct；浅spring（<2%且不足1.5倍日均波幅）质量一般（50%），深度越深越可靠（⚠ 年度摇摆剧烈，按分年中位打折）',
     };
   }
   return null;
+}
+
+// 跌破日量比档位（d32：唯一新增可操作参数——1.5~2.1 温和放量是最优档，>2.1 巨量是最差档）
+// 量比口径：当根量 / 前 20 根均量（不含当日），与源仓 base_break 口径一致
+function breakVolNote(vr: number | null): string {
+  if (vr == null) return '量比?（不可用）';
+  const v = vr.toFixed(2);
+  if (vr > 2.1) return `量比${v}=巨量（>2.1 最差档，抛售未尽）`;
+  if (vr >= 1.5) return `量比${v}=温和放量（1.5~2.1 最优档）`;
+  if (vr < 0.8) return `量比${v}=缩量（<0.8 无人接盘，回避）`;
+  return `量比${v}=平量（一般）`;
 }
 
 // ---- 5. 筑底深跌破（base_break C/D 组，discover_04）----
@@ -288,10 +299,10 @@ function detectBaseBreak(bars: Bar[]): PatternHit | null {
         return {
           label: shrink ? `筑底跌破${group}组·缩量⚠` : `筑底跌破${group}组✓`,
           barsAgo: n - 1 - i,
-          detail: `周线筑底${seg.length}周后跌破支撑${baseLow.toFixed(2)}达${penetration.toFixed(1)}%，跌破日量比${vr != null ? vr.toFixed(2) : '?'}（<0.8为缩量）`,
+          detail: `周线筑底${seg.length}周后跌破支撑${baseLow.toFixed(2)}达${penetration.toFixed(1)}%，跌破日${breakVolNote(vr)}`,
           prior: shrink
             ? '⚠ C/D组×缩量跌破=无人接盘，历史4周收益为负、分年稳定为负——回避信号，勿抄底'
-            : 'C组×非缩量：历史4周胜率78~81%/E+13~16%，分年最稳健的甜点（恐慌释放+有承接）',
+            : 'C组×非缩量：20日E+14.84%/胜率79.6%（⚠ 上界，真实约低16~32%）；持有越长越好——180日+41.97%，4周窗口远未吃完，禁止止盈；跌破日量比1.5~2.1温和放量是最优档（E+18.28%/胜率88.5%，年度p=0.002 非聚类驱动），量比>2.1巨量是最差档（胜率68%，抛售未尽）',
         };
       }
       break; // 只看以 start 开头的最长合法段
@@ -329,8 +340,8 @@ function detectGaps(bars: Bar[]): PatternHit[] {
         barsAgo: filled ? n - 1 - fillIdx : n - 1 - i,
         detail: `${(gapPct * 100).toFixed(1)}%向上跳空${volNote}${filled ? '，收盘已跌回缺口下沿' : `，至今${n - 1 - i}根未回补`}`,
         prior: filled
-          ? '⚠ 缺口回补=离场信号：已回补组历史60日-9.5%/胜率24%（未回补组+18%/61%，分野28pct）'
-          : '未回补缺口=持有锚：历史60日E+18.4%/胜率61%；收盘一旦回补立即离场',
+          ? '⚠ 缺口回补=离场信号：已回补组历史60日-9.5%/胜率24%（未回补组+18%/61%，分野28pct；负信号类：幸存者偏差下方向不变、真实更极端）'
+          : '未回补缺口=持有锚：历史60日E+18.4%/胜率61%（⚠ 上界）；收盘一旦回补立即离场',
       });
     } else {
       hits.push({
@@ -338,7 +349,7 @@ function detectGaps(bars: Bar[]): PatternHit[] {
         barsAgo: filled ? n - 1 - fillIdx : n - 1 - i,
         detail: `${(gapPct * 100).toFixed(1)}%向下跳空${volNote}${filled ? '，收盘已收复缺口上沿' : `，至今${n - 1 - i}根未回补`}`,
         prior: filled
-          ? '向下缺口被回补=利空出尽，历史60日+18%/胜率68%（较强买点之一）'
+          ? '向下缺口被回补=利空出尽，历史60日+18%/胜率68%（较强买点之一；⚠ 上界，按8折规划）'
           : '未回补向下缺口=趋势下跌；若前期大涨后出现，是最强减仓信号（历史仅32%胜收）',
       });
     }
@@ -438,7 +449,7 @@ function detectRange(bars: Bar[]): PatternHit | null {
     barsAgo: 0,
     detail: `近${len}根价格运行于 ${lo.toFixed(2)}~${hi.toFixed(2)}（宽${((hi / lo - 1) * 100).toFixed(0)}%），当前${posLabel}（位置${(pos * 100).toFixed(0)}%）`,
     prior:
-      '横盘本身不是买点（胜率43~52%），价值在右尾：下沿附近才可轻仓潜伏、上沿附近兑现、中段不开新仓（持仓者的离场依据是跌破区间下沿，而非处于中段）；止损必须设在区间边界外（勿设在MA20——震荡中它是噪音线）；收盘跌破下沿非机会，除非演变为深跌出清（跌10~15%+量能不缩）',
+      '横盘本身不是买点（胜率43~52%），价值在右尾：下沿附近才可轻仓潜伏、上沿附近兑现、中段不开新仓；区间边界是离场决策的参考锚而非机械止损位（统计上固定百分比止损各档ΔE全负；MA20 在震荡中是噪音线）；收盘跌破下沿非机会，除非演变为深跌出清（跌10~15%+量能不缩）',
   };
 }
 
